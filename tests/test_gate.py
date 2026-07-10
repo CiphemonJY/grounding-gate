@@ -185,6 +185,24 @@ def test_r4_every_halted_reasoning_step_refused():
     assert all(t[0] == "refused_reasoning" for t in tr[1:4])
 
 
+def test_m1_new_mutation_invalidates_prior_verification():
+    # write -> verifying read -> ANOTHER write -> completion must REJECT
+    # (the verification no longer postdates the last mutation)
+    out, tr = turn_loop([
+        {"type": "tool_call", "tool": "write", "args": "file.txt", "result": "ok",
+         "mutating": True},
+        {"type": "tool_call", "tool": "read", "args": "file.txt", "result": "v1"},
+        {"type": "tool_call", "tool": "write", "args": "file.txt", "result": "ok2",
+         "mutating": True},
+        {"type": "terminal", "attempt": {"claim_type": "completion", "content": "done"}},
+        {"type": "tool_call", "tool": "read", "args": "file.txt", "result": "v2"},
+        {"type": "terminal", "attempt": {"claim_type": "completion", "content": "done"}},
+    ], S())
+    verdicts = [t[1] for t in tr if t[0] == "terminal"]
+    assert verdicts == ["REJECT", "ACCEPT"]    # re-verified after 2nd write
+    assert out == "done"
+
+
 # ------------------------------------------------------- bare-python runner
 
 if __name__ == "__main__":

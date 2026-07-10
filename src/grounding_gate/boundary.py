@@ -91,6 +91,9 @@ def turn_loop(script, state):
                 state.halted = False                               # (C2) qualifying only
             if step.get("mutating"):
                 state.last_mutation_step = state.current_step
+                # a NEW mutation invalidates prior verification — the
+                # verifying observation must postdate the LAST mutation
+                state.verified_this_turn = False
             trace.append(("tool_call", obs))
             continue
 

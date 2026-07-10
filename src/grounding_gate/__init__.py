@@ -13,7 +13,7 @@ from .state import PRESETS, GateState, extract_identifiers, normalize
 from .classifier import classify_observation
 from .boundary import ACCEPT, LEGAL_NEXT, REJECT, boundary_check, turn_loop
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "ACCEPT",

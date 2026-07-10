@@ -26,6 +26,8 @@ jobs:
       - name: Test suite
         run: pytest -q
       - name: Zero-dependency check (tests run on bare python)
-        run: python tests/test_gate.py
+        run: |
+          python tests/test_gate.py
+          python tests/test_agent_sdk_adapter.py
       - name: Demo
         run: python examples/demo.py

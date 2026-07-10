@@ -138,7 +138,7 @@ Honest scope, from the design's leak audit:
 ## How this was built
 
 The modules were drafted by different LLMs and adversarially reviewed before
-assembly; the final behavior is pinned by a 19-case acceptance suite
+assembly; the final behavior is pinned by a 20-case acceptance suite
 ([tests/test_gate.py](https://github.com/CiphemonJY/grounding-gate/blob/main/tests/test_gate.py))
 that runs on bare Python with zero dependencies. Two review findings shaped
 the method and are preserved in the docstrings:
@@ -154,12 +154,56 @@ the method and are preserved in the docstrings:
 Full design spec:
 [docs/spec.md](https://github.com/CiphemonJY/grounding-gate/blob/main/docs/spec.md).
 
+## Claude Agent SDK adapter
+
+`grounding_gate.adapters.claude_agent_sdk` wires the gate into a
+[Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) agent using
+hooks — `PostToolUse` classifies every successful tool result,
+`PostToolUseFailure` conservatively records failed mutating calls (a failed
+write may still have had an effect, so verification is demanded), `Stop` is
+the submit boundary (a rejected finish is blocked and the model is told its
+legal next moves), and `UserPromptSubmit` resets the per-turn latches and
+budget:
+
+```python
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+from grounding_gate.adapters.claude_agent_sdk import GateHooks
+
+gate = GateHooks(model_class="default")          # one instance per session
+options = ClaudeAgentOptions(hooks=gate.as_options_hooks())
+
+async with ClaudeSDKClient(options=options) as client:
+    await client.query("Fix the timeout in app.cfg and confirm it took effect")
+    ...
+```
+
+Identifiers touched by mutating tools join the claim surface automatically —
+*you must verify what you changed* (values only, never JSON schema keys, so a
+read of some unrelated file can't masquerade as verification) — and a new
+mutation invalidates any earlier verification: an agent that edits `app.cfg`
+and tries to finish without re-reading it gets blocked with an explanation,
+and its completion is only accepted after a fresh read that postdates the
+last change. Subagent tool events are excluded from the gate's state by
+default (`gate_subagents=True` opts in).
+
+Because the SDK has no typed terminals, the gate's `unverified` escape hatch
+becomes an escape valve: after `max_blocks` rejected finishes — or when the
+per-turn reasoning budget runs out, whichever comes first — the stop is
+allowed, **`gate.exited_unverified` is set** (check this flag in headless
+runs), and a `systemMessage` warning is returned. Per the SDK contract that
+message is shown to the *user*, not the model, and appears in headless runs
+only with `include_hook_events` enabled — the flag is the reliable marker.
+The gate never traps an agent.
+
+The adapter adds no dependency: grounding-gate stays stdlib-only, and only
+`as_options_hooks()` requires `claude-agent-sdk` to be installed.
+
 ## Status & roadmap
 
 This is the reference implementation — correct, minimal, and framework-free.
-Planned next:
+Shipped: the Claude Agent SDK hook adapter (above). Planned next:
 
-- Adapters: Claude Agent SDK hook, LangGraph middleware, OpenAI Agents SDK.
+- Adapters: LangGraph middleware, OpenAI Agents SDK.
 - A real signal-mapper module (command exit code → declared signal).
 - Empirical preset tuning across model classes.
 
