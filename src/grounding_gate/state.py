@@ -23,6 +23,8 @@ class GateState:
     budget: int
     cap: int
     refill: int
+    # strict G (skipper preset): even assertions require the verified tier
+    strict_g: bool = False
     # novelty
     recent_result_hashes: set = field(default_factory=set)
     novelty_exempt: set = field(default_factory=set)
@@ -42,6 +44,7 @@ class GateState:
     @classmethod
     def for_model_class(cls, model_class="default", **kw):
         p = PRESETS[model_class]
+        kw.setdefault("strict_g", p["strict_g"])
         return cls(budget=p["CAP"], cap=p["CAP"], refill=p["REFILL"], **kw)
 
 

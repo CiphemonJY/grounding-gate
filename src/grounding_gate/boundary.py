@@ -45,7 +45,10 @@ def boundary_check(terminal_attempt, state):
         return {"verdict": ACCEPT, "legal_next": []}
 
     if ct == "assertion":
-        if not state.grounded_this_turn:
+        # strict G (skipper preset): observed tier is not enough — even an
+        # assertion needs verified-tier grounding (spec module 6)
+        grounded = state.verified_this_turn if state.strict_g else state.grounded_this_turn
+        if not grounded:
             state.halted = True
             return {"verdict": REJECT, "legal_next": LEGAL_NEXT}
         state.halted = False

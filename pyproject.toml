@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,8 @@ name = "grounding-gate"
 version = "0.1.0"
 description = "Zero-token structural verifier for agent loops: one choke point at the submit boundary enforcing grounding and budget invariants. No LLM calls, stdlib only."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "Ciphemon" }]
 keywords = [
@@ -22,7 +23,6 @@ keywords = [
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
@@ -37,7 +37,9 @@ dev = ["pytest>=7"]
 
 [project.urls]
 Homepage = "https://github.com/CiphemonJY/grounding-gate"
+Repository = "https://github.com/CiphemonJY/grounding-gate"
 Issues = "https://github.com/CiphemonJY/grounding-gate/issues"
+Changelog = "https://github.com/CiphemonJY/grounding-gate/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/grounding_gate"]

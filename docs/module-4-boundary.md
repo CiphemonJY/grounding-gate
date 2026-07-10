@@ -52,7 +52,9 @@ function boundary_check(terminal_attempt, state):
         return { verdict: ACCEPT, legal_next: [] }
 
     if ct == assertion:
-        if NOT state.grounded_this_turn:
+        grounded = state.verified_this_turn if state.strict_g    # strict G (module 6):
+                   else state.grounded_this_turn                 # skipper preset requires
+        if NOT grounded:                                         # verified tier even here
             reject as above
         state.halted = false
         return { verdict: ACCEPT, legal_next: [] }

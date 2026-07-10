@@ -9,6 +9,12 @@ per-turn prompt injection, no dependencies.
 
 ```
 pip install grounding-gate      # stdlib only, Python >= 3.9
+```
+
+The demo ships in the repo (not the wheel):
+
+```
+git clone https://github.com/CiphemonJY/grounding-gate && cd grounding-gate
 python examples/demo.py         # the whole idea in 30 seconds
 ```
 
@@ -65,11 +71,13 @@ from grounding_gate import GateState, classify_observation, boundary_check
 
 state = GateState.for_model_class("default", claim_surface={"app.cfg"})
 
-# after every tool call in your agent loop:
+# after EVERY tool call in your agent loop:
 state.current_step += 1
-obs = classify_observation("read", "app.cfg", result_text, state, read_only=True)
+obs = classify_observation(tool, args, result, state, read_only=not mutating)
 state.grounded_this_turn |= obs["grounds_assertion"]
 state.verified_this_turn |= obs["grounds_completion"]
+if mutating:
+    state.last_mutation_step = state.current_step   # a completion now needs a read AFTER this
 
 # at every submit/conclude attempt — this must be the ONLY path to output:
 verdict = boundary_check({"claim_type": "completion", "content": answer}, state)
@@ -77,11 +85,15 @@ if verdict["verdict"] == "REJECT":
     ...  # surface verdict["legal_next"] to the model and continue the loop
 ```
 
-`turn_loop` in [boundary.py](src/grounding_gate/boundary.py) is the complete
-reference wiring (budget refill, mutation tracking, halt semantics, signal
-mapping) — use it as the integration template. The
-[demo](examples/demo.py) runs the same scripted agent through an ungated and a
-gated loop, side by side.
+Note the mutation bookkeeping: without `last_mutation_step` ever being set, no
+read can reach the verified tier and a `completion` can never be accepted —
+that is the gate working as designed, not a bug.
+
+`turn_loop` in [boundary.py](https://github.com/CiphemonJY/grounding-gate/blob/main/src/grounding_gate/boundary.py)
+is the complete reference wiring (budget refill, mutation tracking, halt
+semantics, signal mapping) — use it as the integration template. The
+[demo](https://github.com/CiphemonJY/grounding-gate/blob/main/examples/demo.py)
+runs the same scripted agent through an ungated and a gated loop, side by side.
 
 ## Model-class presets
 
@@ -93,6 +105,12 @@ how your model fails:
 | `skipper`  | 5   | 2      | yes      | models that hallucinate-and-skip |
 | `diverger` | 4   | 1      | no       | models that reason forever |
 | `default`  | 6   | 2      | no       | everything else |
+
+Strict G means even plain *assertions* require verified-tier grounding (a
+post-mutation observation) — an observed-tier read is not enough. In a task
+that never mutates anything, a strict-G agent can only exit via the typed
+`unverified` terminal; that hard line is the point of the skipper preset, so
+pick `default` for read-only/Q&A workloads.
 
 ## Declarative rails
 
@@ -120,19 +138,21 @@ Honest scope, from the design's leak audit:
 ## How this was built
 
 The modules were drafted by different LLMs and adversarially reviewed before
-assembly; the final behavior is pinned by a 17-case acceptance suite
-([tests/test_gate.py](tests/test_gate.py)) that runs on bare Python with zero
-dependencies. Two review findings shaped the method and are preserved in the
-docstrings:
+assembly; the final behavior is pinned by a 19-case acceptance suite
+([tests/test_gate.py](https://github.com/CiphemonJY/grounding-gate/blob/main/tests/test_gate.py))
+that runs on bare Python with zero dependencies. Two review findings shaped
+the method and are preserved in the docstrings:
 
 - A drafting model shipped a consequence-tier bug **and authored the test that
   ratified it** — since then, expected outcomes are authored by the reviewer,
-  never by the generator ([docs/module-2-classifier.md](docs/module-2-classifier.md)).
+  never by the generator
+  ([docs/module-2-classifier.md](https://github.com/CiphemonJY/grounding-gate/blob/main/docs/module-2-classifier.md)).
 - The remaining leaks lived *between* individually-passing test cases —
   latch-vs-assignment, halt cleared by non-qualifying calls
-  ([docs/module-4-boundary.md](docs/module-4-boundary.md)).
+  ([docs/module-4-boundary.md](https://github.com/CiphemonJY/grounding-gate/blob/main/docs/module-4-boundary.md)).
 
-Full design spec: [docs/spec.md](docs/spec.md).
+Full design spec:
+[docs/spec.md](https://github.com/CiphemonJY/grounding-gate/blob/main/docs/spec.md).
 
 ## Status & roadmap
 

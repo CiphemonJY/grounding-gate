@@ -122,5 +122,5 @@ default CAP=6/REFILL=2. Tune empirically.
 ## Acceptance
 
 Every adversarial transcript rejected, every valid transcript passes, choke point provably
-the sole exit, zero LLM calls in Modules 1–4. Pinned by the 17-case suite in
+the sole exit, zero LLM calls in Modules 1–4. Pinned by the 19-case suite in
 [tests/test_gate.py](../tests/test_gate.py).

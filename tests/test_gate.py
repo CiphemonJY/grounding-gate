@@ -119,6 +119,23 @@ def test_a3_verified_completion_with_signals_accepted():
         {"claim_type": "completion", "content": "x"}, st)["verdict"] == ACCEPT
 
 
+def test_s1_strict_g_rejects_observed_tier_assertion():
+    # skipper preset: a merely-observed (read-only) grounding must NOT
+    # license an assertion — verified tier is required (spec module 6)
+    st = GateState.for_model_class("skipper", claim_surface={"file.txt"})
+    st.grounded_this_turn = True
+    assert boundary_check(
+        {"claim_type": "assertion", "content": "x"}, st)["verdict"] == REJECT
+
+
+def test_s2_strict_g_accepts_verified_tier_assertion():
+    st = GateState.for_model_class("skipper", claim_surface={"file.txt"})
+    st.grounded_this_turn = True
+    st.verified_this_turn = True
+    assert boundary_check(
+        {"claim_type": "assertion", "content": "x"}, st)["verdict"] == ACCEPT
+
+
 # ---------------------------------------------- Integration: turn_loop leaks
 
 def test_l1_verified_latch_survives_later_noop_call():
