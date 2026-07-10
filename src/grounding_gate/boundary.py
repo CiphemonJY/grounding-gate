@@ -69,7 +69,11 @@ def turn_loop(script, state):
     trace = []
     for step in script:
         if step["type"] == "reasoning":
-            state.budget -= 1                                     # (C4) refusals starve too
+            # floored at 0: the divergence defense only ever tests <= 0 at
+            # the boundary, so a deeper pit adds nothing — it only makes
+            # recovery after entry-heavy reasoning cost more than one
+            # qualifying observation
+            state.budget = max(state.budget - 1, 0)               # (C4) refusals starve too
             if state.halted:
                 trace.append(("refused_reasoning", LEGAL_NEXT))
                 continue

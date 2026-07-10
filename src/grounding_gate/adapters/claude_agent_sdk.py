@@ -7,6 +7,8 @@ SDK hook event        Gate role
 ====================  =======================================================
 ``PostToolUse``       Observation classifier: every successful tool result is
                       classified (novel ∧ relevant ∧ consequence-tier).
+                      Latches update as in ``turn_loop``; budget REFILLS on
+                      qualifying observations, but note the asymmetry below.
 ``PostToolUseFailure``A FAILED mutating call may still have had an effect, so
                       it conservatively records a mutation (verification is
                       demanded) while earning no grounding credit.
@@ -32,6 +34,13 @@ forbids *confident* ungrounded claims (see the design spec).
 Subagent events (hook inputs carrying ``agent_id``) are ignored by default so
 a subagent's observations can't ground the main agent's claims; pass
 ``gate_subagents=True`` to include them in the shared state instead.
+
+BUDGET ASYMMETRY (be honest with yourself about this): the SDK has no hook
+for a pure reasoning step, so unlike the reference ``turn_loop`` the budget
+here never decrements on thinking — only on rejected finishes. The
+anti-divergence floor in SDK integrations is therefore enforced primarily by
+the ``max_blocks`` counter; the budget is a secondary backstop, not the
+per-step rope it is in the reference loop.
 
 Usage::
 
@@ -136,6 +145,16 @@ class GateHooks:
         gate_subagents: include subagent hook events (``agent_id`` set) in
             this gate's state. Default False: subagent observations must not
             ground the main agent's claims.
+        normalizers: per-tool novelty scrubbers, ``{tool_name: callable}``.
+            A noisy tool (nonstandard timestamps, changing counters) gets its
+            own scrubber; it runs before the built-in ``normalize()``. The
+            callable receives the SERIALIZED tool input/response (JSON text),
+            so write substring-safe regex scrubbers, and keep them
+            deterministic.
+        extractors: per-tool relevance extractors,
+            ``{tool_name: callable(args, result) -> set}`` — for tools whose
+            output lives in a different lexical domain than the claim
+            surface (inodes, opaque handles). Receives serialized text.
 
     Attributes:
         exited_unverified: True when the LAST allowed stop went through the
@@ -146,9 +165,12 @@ class GateHooks:
     def __init__(self, claim_surface=(), model_class="default",
                  read_only_tools=DEFAULT_READ_ONLY_TOOLS,
                  mutating_tools=DEFAULT_MUTATING_TOOLS,
-                 max_blocks=3, gate_subagents=False):
+                 max_blocks=3, gate_subagents=False,
+                 normalizers=None, extractors=None):
         self.state = GateState.for_model_class(
-            model_class, claim_surface=set(claim_surface))
+            model_class, claim_surface=set(claim_surface),
+            normalizers=dict(normalizers or {}),
+            extractors=dict(extractors or {}))
         self.read_only_tools = set(read_only_tools)
         self.mutating_tools = set(mutating_tools)
         self.max_blocks = max_blocks
@@ -167,10 +189,10 @@ class GateHooks:
             return {}
         tool = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", "")
-        # mutation-epoch prefix: a fresh mutation re-opens novelty for the
-        # verifying re-read (otherwise an idempotent write could never be
-        # verified — the identical post-write read would be novelty-defeated)
-        args = "[m%d]" % self.state.last_mutation_step + _serialize(tool_input)
+        # (mutation-epoch novelty — a fresh mutation re-opening the verifying
+        # re-read — lives in classify_observation's hash tuple, not in the
+        # text, so custom normalizers can't corrupt it)
+        args = _serialize(tool_input)
         result = _serialize(input_data.get("tool_response", ""))
 
         self._tool_calls_this_turn += 1
@@ -220,7 +242,7 @@ class GateHooks:
             return {}
 
         self._blocks += 1
-        self.state.budget -= 1          # rejected attempts burn rope
+        self.state.budget = max(self.state.budget - 1, 0)   # rejected attempts burn rope
         if self._blocks > self.max_blocks or self.state.budget <= 0:
             # escape valve — the typed `unverified` exit. Never trap.
             self._blocks = 0

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grounding-gate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Zero-token structural verifier for agent loops: one choke point at the submit boundary enforcing grounding and budget invariants. No LLM calls, stdlib only."
 readme = "README.md"
 license = "MIT"

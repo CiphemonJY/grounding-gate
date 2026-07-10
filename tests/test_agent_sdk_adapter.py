@@ -202,6 +202,48 @@ def test_new_turn_restores_budget():
     assert gate.exited_unverified is False
 
 
+def test_normalizer_passthrough_defeats_noisy_reread():
+    import re as _re
+    scrub = {"Read": lambda t: _re.sub(r"@up \d+s@", "@up X@", t)}
+    noisy1 = "retries=5 @up 4321s@"
+    noisy2 = "retries=5 @up 9876s@"   # same content, uptime counter moved
+    # without the scrubber the stale re-read wrongly re-grounds
+    bare = GateHooks(claim_surface={"svc.cfg"})
+    run(bare.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, noisy1), "t1", None))
+    run(bare.user_prompt_submit(PROMPT, None, None))
+    run(bare.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, noisy2), "t2", None))
+    assert bare.state.grounded_this_turn        # the hole James pointed at
+    # with the scrubber, novelty correctly defeats it
+    gated = GateHooks(claim_surface={"svc.cfg"}, normalizers=scrub)
+    run(gated.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, noisy1), "t1", None))
+    run(gated.user_prompt_submit(PROMPT, None, None))
+    run(gated.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, noisy2), "t2", None))
+    assert not gated.state.grounded_this_turn
+
+
+def test_digit_stripping_normalizer_cannot_break_epoch_novelty():
+    # the mutation epoch lives in the hash tuple, not the text — a scrubber
+    # that erases every digit still can't stop the post-write re-read of
+    # textually-identical content from verifying
+    import re as _re
+    gate = GateHooks(normalizers={"Read": lambda t: _re.sub(r"\d", "", t)})
+    run(gate.post_tool_use(ptu("Read", {"file_path": "a.cfg"}, "v=1"), "t1", None))
+    run(gate.post_tool_use(ptu("Write", {"file_path": "a.cfg",
+                                         "content": "v=1"}, "ok"), "t2", None))
+    run(gate.post_tool_use(ptu("Read", {"file_path": "a.cfg"}, "v=1"), "t3", None))
+    assert run(gate.stop(STOP, None, None)) == {}
+
+
+def test_extractor_passthrough_bridges_lexical_domains():
+    gate = GateHooks(
+        claim_surface={"app.cfg"},
+        read_only_tools=set(GateHooks().read_only_tools) | {"StatFile"},
+        extractors={"StatFile": lambda a, r: {"app.cfg"}})
+    run(gate.post_tool_use(ptu("StatFile", {"handle": "h7"}, "ino:8812732"),
+                           "t1", None))
+    assert run(gate.stop(STOP, None, None)) == {}
+
+
 def test_strict_g_reason_is_actionable():
     gate = GateHooks(claim_surface={"svc.cfg"}, model_class="skipper")
     run(gate.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, "d"), "t1", None))

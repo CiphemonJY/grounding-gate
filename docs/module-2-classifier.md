@@ -67,9 +67,15 @@ function classify_observation(tool, args, result, state) -> {grounds_assertion, 
 | T5 | read predating the mutation | `{true, false}` |
 | T6 | post-mutation re-read (valid verified) | `{true, true}` |
 
-## Open implementation risks (flagged, not resolved here)
+## Open implementation risks — and their mitigation hooks
 
 - `normalize()` must strip timestamps/rng or novelty never fires on nondeterministic
-  tools; `novelty_exempt` is a small audited allowlist.
+  tools (a miss fails toward wrong re-acceptance). The reference default covers ISO,
+  syslog, RFC822/bare dates, clock times, relative times, and hex/long-digit ids;
+  anything noisier registers a per-tool scrubber in `GateState.normalizers` — it runs
+  first, and the default floor always applies after. `novelty_exempt` remains a small
+  audited allowlist for tools whose output is legitimately never-repeating.
 - `extract_identifiers()` must be conservative — over-extraction leaks relevance,
-  under-extraction false-rejects cross-cutting work.
+  under-extraction false-rejects cross-cutting work (blocked work, never wrong
+  acceptance). Tools whose output lives in a different lexical domain than the claim
+  surface (inodes, opaque handles) register a per-tool `GateState.extractors` entry.

@@ -131,14 +131,45 @@ Honest scope, from the design's leak audit:
   identifiers in an irrelevant call. The floor defends against *lazy*
   ungroundedness, which is the overwhelmingly common failure; adversarial
   self-deception needs the verifier tier.
-- **Nondeterministic tools** need per-tool `normalize()` extensions or the
-  audited `novelty_exempt` allowlist — too-weak normalization quietly disables
-  the no-op defense.
+- **The completion tier checks freshness, not coverage.** A completion needs
+  a novel, relevant observation taken after the last mutation — the gate
+  cannot prove that observation was *of the mutated item* when the claim
+  surface holds several identifiers (re-reading unchanged `a.cfg` after
+  editing `b.cfg` passes if both are on the surface). The adapter narrows
+  this by auto-adding mutated identifiers, but a broad user-seeded surface
+  keeps the coarseness. Tracking per-mutation coverage is future work.
+- **Nondeterministic tools defeat novelty unless you tell the gate about
+  them.** The default `normalize()` strips the common timestamp shapes —
+  ISO (second- or minute-precision), syslog and `ls -l` listings, RFC822/1123
+  dates with day-of-week, bare and US dates, 12/24-hour clock times, relative
+  times through years — plus UUIDs and hex/long-digit ids. But no fixed list
+  covers every tool (short counters and digit runs glued into hex-letter
+  words are known residuals), and a missed pattern fails toward wrong
+  re-acceptance. Register a per-tool scrubber in `GateState.normalizers`
+  (or `GateHooks(normalizers=...)`); it runs before the default, which
+  always still applies — keep scrubbers deterministic.
+- **Relevance can under-extract across lexical domains** — a tool returning
+  an inode number never intersects a claim surface of file paths, and the
+  gate false-rejects (blocked work, never wrong acceptance). Register a
+  per-tool `GateState.extractors` entry mapping that tool's output back to
+  surface identifiers. Registered extractors REPLACE the default and *are*
+  the relevance gate for that tool: derive identifiers from what the call
+  actually touched — an unconditional constant set makes every call
+  "relevant" and reopens the wrong-acceptance door the default keeps shut.
+- **The budget is a hard line, and it's tunable.** Presets are starting
+  guesses: `diverger` (CAP 4) deliberately forces early grounding, so a model
+  that front-loads reasoning wants
+  `GateState.for_model_class("diverger", cap=10)` (the `1 <= refill < cap`
+  invariant is enforced). The budget floors at zero — one qualifying
+  observation restores assert-ability (under strict-G, that observation must
+  be verified-tier, per the preset's rule). In the Agent SDK adapter the
+  budget is secondary (no reasoning-step hook exists there); `max_blocks` is
+  the operative floor.
 
 ## How this was built
 
 The modules were drafted by different LLMs and adversarially reviewed before
-assembly; the final behavior is pinned by a 20-case acceptance suite
+assembly; the final behavior is pinned by a 30-case acceptance suite
 ([tests/test_gate.py](https://github.com/CiphemonJY/grounding-gate/blob/main/tests/test_gate.py))
 that runs on bare Python with zero dependencies. Two review findings shaped
 the method and are preserved in the docstrings:

@@ -60,9 +60,12 @@ review history.
 ## Module 3 — Budget engine (divergence killer, net token-NEGATIVE)
 
 Per step: if step ended on a qualifying grounding obs → `budget = min(budget+REFILL, CAP)`;
-else (pure reasoning / repeat / no-op) → `budget -= 1`. If `budget <= 0` → HALT.
-Invariant: `1 <= REFILL < CAP`. Grounded work → effectively unbounded; closed-loop
-reasoning → hard floor.
+else (pure reasoning / repeat / no-op) → `budget = max(budget-1, 0)` (floored: the defense
+only ever tests `<= 0` at the boundary, so a deeper pit adds nothing — it would only make
+recovery after entry-heavy reasoning cost more than one qualifying observation). If
+`budget <= 0` → claim-bearing terminals HALT. Invariant: `1 <= REFILL < CAP`. Grounded
+work → effectively unbounded; closed-loop reasoning → hard floor. Preset CAP/REFILL are
+starting guesses — `for_model_class(..., cap=, refill=)` overrides them per model.
 
 ## Module 4 — Boundary check (the ONE choke point)
 
@@ -122,5 +125,5 @@ default CAP=6/REFILL=2. Tune empirically.
 ## Acceptance
 
 Every adversarial transcript rejected, every valid transcript passes, choke point provably
-the sole exit, zero LLM calls in Modules 1–4. Pinned by the 20-case suite in
+the sole exit, zero LLM calls in Modules 1–4. Pinned by the 30-case suite in
 [tests/test_gate.py](../tests/test_gate.py).

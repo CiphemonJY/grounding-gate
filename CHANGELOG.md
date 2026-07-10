@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0 — 2026-07-10
+
+Addresses three reviewer findings on novelty coverage, relevance domains,
+and budget ergonomics:
+
+- `normalize()` now strips syslog and `ls -l` listing timestamps (both
+  forms), RFC822/1123 dates with optional day-of-week, bare/US dates,
+   12/24-hour clock times (AM/PM marker consumed), minute-precision ISO,
+  relative times through years, dashed UUIDs, and case-insensitive hex —
+  in addition to second-precision ISO + long-digit ids. Stale re-reads in
+  these formats no longer re-ground (wrong-acceptance fixes), and the ISO
+  tail is bounded so payload glued to a timestamp survives (wrong-rejection
+  fix). For formats beyond the defaults, per-tool scrubbers register in
+  `GateState.normalizers` / `GateHooks(normalizers=...)`; custom scrubbers
+  run first and the default floor always applies after.
+- The mutation epoch moved INTO the novelty hash tuple (core + adapter):
+  the reference `turn_loop` can now verify date-only/idempotent changes
+  (previously impossible there), and custom normalizers can no longer
+  corrupt the epoch (it isn't in the text anymore).
+- `for_model_class` enforces the `1 <= refill < cap` invariant; extractor
+  return values are coerced to sets (any iterable; a bare string counts as
+  ONE identifier, not a character set).
+- From the post-fix skeptic pass: `0x`-prefixed addresses (Python reprs)
+  are scrubbed; month-name rules stop at line breaks (end-of-line counters
+  survive); US dates require a 19xx/20xx year (block sizes survive). Bare
+  24-hour `HH:MM` deliberately survives (scores/ratios ambiguity) and is
+  documented as a residual for per-tool normalizers, as is the completion
+  tier's freshness-not-coverage semantics.
+- Per-tool relevance extractors (`GateState.extractors` /
+  `GateHooks(extractors=...)`) bridge lexical-domain mismatches (inodes,
+  opaque handles) that the default token extractor can never intersect.
+- Budget floors at zero: entry-heavy reasoning no longer digs an
+  unrecoverable pit — one qualifying observation restores assert-ability.
+  `for_model_class()` accepts `cap=`/`refill=` overrides, and the adapter
+  documents the SDK budget asymmetry (no reasoning-step hook exists there;
+  `max_blocks` is the operative floor).
+- Suite grows to 26 core + 22 adapter cases.
+
 ## 0.2.0 — 2026-07-10
 
 - Claude Agent SDK adapter (`grounding_gate.adapters.claude_agent_sdk`):
