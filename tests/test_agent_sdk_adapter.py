@@ -16,6 +16,7 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from grounding_gate.adapters.claude_agent_sdk import UNVERIFIED_BANNER, GateHooks
+from grounding_gate.verifiers import StubVerifier
 
 run = asyncio.run
 
@@ -250,6 +251,65 @@ def test_strict_g_reason_is_actionable():
     out = run(gate.stop(STOP, None, None))
     assert out["decision"] == "block"
     assert "strict-G" in out["reason"]              # never an empty parenthetical
+
+
+# ------------------------------------------- progress telemetry + verify_with
+
+def test_progress_accessor():
+    gate = GateHooks(claim_surface={"svc.cfg"})
+    run(gate.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, "retries=5"), "t1", None))
+    p = gate.progress()
+    assert p["grounded_this_turn"] is True
+    assert p["observations_this_turn"] >= 1
+    # state keys AND adapter-only keys are both present
+    for k in ("budget", "cap", "step", "rejection_count", "unmet_signals"):
+        assert k in p
+    for k in ("blocks", "max_blocks", "tool_calls_this_turn", "exited_unverified"):
+        assert k in p
+
+
+def test_emit_progress_appends_banner():
+    gate = GateHooks(emit_progress=True, max_blocks=0)
+    run(gate.post_tool_use(ptu("Write", {"file_path": "a.txt"}, "ok"), "t1", None))
+    out = run(gate.stop(STOP, None, None))
+    assert UNVERIFIED_BANNER in out["systemMessage"]
+    assert "[progress" in out["systemMessage"]        # a compact summary is appended
+
+
+def test_verifier_downgrades_grounded_finish():
+    # a FLOOR-accepted finish (write then post-mutation read) that the verifier
+    # rejects is blocked with a verify-tier reason...
+    down = GateHooks(verifier=StubVerifier(0.0))
+    run(down.post_tool_use(ptu("Write", {"file_path": "app.cfg",
+                                         "content": "timeout=30"}, "ok"), "t1", None))
+    run(down.post_tool_use(ptu("Read", {"file_path": "app.cfg"}, "timeout=30"), "t2", None))
+    out = run(down.stop(STOP, None, None))
+    assert out["decision"] == "block"
+    assert "verify_with" in out["reason"]
+    # ...while a confident verifier leaves the identical finish accepted
+    ok = GateHooks(verifier=StubVerifier(1.0))
+    run(ok.post_tool_use(ptu("Write", {"file_path": "app.cfg",
+                                       "content": "timeout=30"}, "ok"), "t1", None))
+    run(ok.post_tool_use(ptu("Read", {"file_path": "app.cfg"}, "timeout=30"), "t2", None))
+    assert run(ok.stop(STOP, None, None)) == {}
+
+
+def test_verifier_downgrade_reaches_escape_valve():
+    # a downgrade feeds the UNCHANGED escape path, so the agent is never trapped
+    gate = GateHooks(verifier=StubVerifier(0.0), max_blocks=0)
+    run(gate.post_tool_use(ptu("Write", {"file_path": "app.cfg"}, "ok"), "t1", None))
+    run(gate.post_tool_use(ptu("Read", {"file_path": "app.cfg"}, "v"), "t2", None))
+    out = run(gate.stop(STOP, None, None))
+    assert out == {"systemMessage": UNVERIFIED_BANNER}
+    assert gate.exited_unverified is True
+
+
+def test_turn_observations_reset():
+    gate = GateHooks(claim_surface={"svc.cfg"})
+    run(gate.post_tool_use(ptu("Read", {"file_path": "svc.cfg"}, "d"), "t1", None))
+    assert gate.state.turn_observations                 # non-empty after a qualifying read
+    run(gate.user_prompt_submit(PROMPT, None, None))
+    assert gate.state.turn_observations == []           # emptied by the turn reset
 
 
 # ------------------------------------------------------- bare-python runner

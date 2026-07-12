@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grounding-gate"
-version = "0.3.0"
+version = "0.4.0"
 description = "Zero-token structural verifier for agent loops: one choke point at the submit boundary enforcing grounding and budget invariants. No LLM calls, stdlib only."
 readme = "README.md"
 license = "MIT"
@@ -34,6 +34,13 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# Optional verify_with LLM tier (grounding_gate.verifiers.llm). The ONLY place
+# the Anthropic SDK is declared — the floor (Modules 1-4) stays stdlib-only and
+# never imports it.
+llm = ["anthropic>=0.40"]
+# Convenience extra for examples/tune_presets.py (not shipped in the wheel, so
+# this is a dev/example dependency, never a runtime one).
+tuning = ["lcb-gate>=0.1"]
 
 [project.urls]
 Homepage = "https://github.com/CiphemonJY/grounding-gate"

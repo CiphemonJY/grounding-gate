@@ -37,13 +37,34 @@ class GateState:
     # consequence
     last_mutation_step: int = 0   # 0 = no mutation has EVER occurred
     current_step: int = 0
+    # last step at which a VERIFIED-tier (post-mutation) observation landed.
+    # A MONOTONIC step marker like last_mutation_step (0 = never), maintained
+    # by the wiring layer (turn_loop / adapter), NEVER reset per turn — so
+    # progress()'s steps_since_last_verification can point across a turn
+    # boundary. Kept out of classify_observation to leave Module 2 byte-identical.
+    last_verification_step: int = 0
+    # TASK-CUMULATIVE count of structural + verifier-downgrade REJECTs at the
+    # boundary. Not per-turn — boundary_check increments it on every REJECT.
+    rejection_count: int = 0
     # per-turn latches
     grounded_this_turn: bool = False
     verified_this_turn: bool = False
+    # per-turn qualifying observations retained for the optional verifier tier
+    # (verify_with) and progress() telemetry. Reset with the other per-turn
+    # latches by the wiring layer (adapter user_prompt_submit); turn_loop is
+    # single-turn so it starts empty. Populated in the WIRING layer only, never
+    # in classify_observation.
+    turn_observations: list = field(default_factory=list)
     # declarative rails
     verified_signals: set = field(default_factory=set)
     goal_predicates: list = field(default_factory=list)
     halted: bool = False
+    # granularity gate for the optional verify_with tier: a verifier confidence
+    # strictly below this DOWNGRADES a structural ACCEPT to the typed
+    # `unverified` path. Literal 0.5 mirrors verifiers.GRANULARITY (NOT imported
+    # here — state.py stays free of the optional subpackage so the floor never
+    # reaches toward it).
+    verify_threshold: float = 0.5
 
     @classmethod
     def for_model_class(cls, model_class="default", cap=None, refill=None, **kw):
@@ -62,6 +83,48 @@ class GateState:
                 "breaks one-observation recovery; refill >= cap makes the "
                 "budget meaningless" % (refill, cap))
         return cls(budget=cap, cap=cap, refill=refill, **kw)
+
+    def progress(self):
+        """Zero-token telemetry snapshot — a PURE function of GateState.
+
+        Makes NO tool call and NO model call: the structural analog of the
+        paper's Claude Code progress monitor, computed only from the integers,
+        booleans, and sets the gate already tracks. Safe to call anywhere; it
+        mutates nothing (call it twice, get equal dicts).
+
+        Two fields carry semantics a casual reader might misjudge, so they are
+        spelled out here:
+          * ``rejection_count`` is TASK-CUMULATIVE, not per-turn — every REJECT
+            at the boundary (structural or verifier-downgrade) increments it and
+            it is never reset. A consumer wanting per-turn counts must diff
+            snapshots itself.
+          * ``steps_since_last_verification`` is derived from the MONOTONIC
+            ``last_verification_step`` marker, which is not reset per turn, so
+            it can report a positive delta even while ``verified_this_turn`` is
+            already False (it means "N steps since anything was verified",
+            spanning turn boundaries). ``None`` means nothing has verified yet.
+        ``steps_since_last_mutation`` mirrors that (``None`` = no mutation ever).
+        """
+        return {
+            "budget": self.budget,
+            "cap": self.cap,
+            "refill": self.refill,
+            "budget_headroom": self.cap - self.budget,
+            "step": self.current_step,
+            "grounded_this_turn": self.grounded_this_turn,
+            "verified_this_turn": self.verified_this_turn,
+            "rejection_count": self.rejection_count,
+            "steps_since_last_mutation": (
+                self.current_step - self.last_mutation_step
+                if self.last_mutation_step > 0 else None),
+            "steps_since_last_verification": (
+                self.current_step - self.last_verification_step
+                if self.last_verification_step > 0 else None),
+            "halted": self.halted,
+            "observations_this_turn": len(self.turn_observations),
+            "unmet_signals": [s for s in self.goal_predicates
+                              if s not in self.verified_signals],
+        }
 
 
 # Applied in order; the broad hex/long-digit rule runs LAST. Note the hex rule

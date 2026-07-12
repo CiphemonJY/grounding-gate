@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.0 — 2026-07-12
+
+Adds an optional verifier tier, zero-token progress telemetry, and a
+reproducible preset-tuning harness. Modules 1-4 remain ZERO-LLM and
+stdlib-only; nothing optional is imported by the core (`import grounding_gate`
+works with no extra deps), exactly as the Claude Agent SDK adapter already is.
+
+- Optional `verify_with` verifier tier — the new `grounding_gate.verifiers`
+  subpackage. `verifiers/__init__.py` is stdlib-only (a `runtime_checkable`
+  `Verifier` Protocol, a deterministic `StubVerifier`, plus `criteria_for` /
+  `aggregate` / `GRANULARITY`); `verifiers/llm.py` adds an `LLMVerifier`
+  reference impl that lazily imports the Anthropic SDK behind the new `[llm]`
+  extra (criteria DECOMPOSITION + K-sample REPEATED EVALUATION — an honest
+  Monte-Carlo estimate, since the Messages API exposes no scoring-token
+  logprobs; no `temperature`/`top_p`/`top_k`, which 400 on current models). The
+  tier is wired at the submit boundary (`boundary_check` / `turn_loop` /
+  `GateHooks` gain an optional `verifier=`) as an escalation that can ONLY
+  downgrade a structural ACCEPT to the typed `unverified` path, never upgrade a
+  structural REJECT — the floor runs first and independently, and `verifier=None`
+  is a byte-identical no-op. Reached only through the sole helper
+  `_maybe_downgrade` at the two claim-bearing ACCEPT points, so a rejected
+  terminal is never handed to a verifier. This implements the leak-audit
+  escalation the design named for semantic misreads / relevance-spoofing /
+  adversarial self-deception.
+- `GateState.progress()` — a zero-token, pure-function telemetry snapshot
+  (budget/headroom, step, grounding latches, task-cumulative `rejection_count`,
+  monotonic steps-since-last-mutation/verification, unmet signals). Surfaced by
+  the adapter's `GateHooks.progress()` accessor (merged with adapter-only
+  counters — the reliable programmatic surface) and an opt-in `emit_progress`
+  event that suffixes the UNVERIFIED escape-valve `systemMessage` with a compact
+  summary. New defaulted `GateState` fields (`turn_observations`,
+  `verify_threshold`, `last_verification_step`, `rejection_count`) keep
+  `for_model_class(**kw)` unaffected; observation retention lives in the wiring
+  layer (`turn_loop` / adapter), so Module 2 (`classify_observation`) stays
+  byte-identical and zero-LLM.
+- Reproducible preset-tuning harness `examples/tune_presets.py` (not shipped in
+  the wheel) that dogfoods the sibling `lcb-gate` package: it sweeps
+  CAP/REFILL/strict_g over SEEDED synthetic transcripts and ranks candidates by
+  paired-seed win-rate LCB via `lcb_gate.compare()` (common random numbers). No
+  fabricated "tuned" numbers are committed — it prints a ranked table on demand
+  and writes nothing; `lcb-gate` is imported lazily behind an optional `tuning`
+  extra and the script self-checks + exits 0 when it is absent.
+- Suite grows to 42 core + 28 adapter + 9 verifier cases, all hermetic
+  (`StubVerifier` only, no network); new cases pin the invariants: the floor
+  stays zero-LLM (`'anthropic'` absent after `import grounding_gate`), the
+  verifier downgrades ACCEPT->unverified below threshold but can NEVER upgrade a
+  REJECT, `unverified`/`none` are never escalated, and the `progress()` shape.
+
 ## 0.3.0 — 2026-07-10
 
 Addresses three reviewer findings on novelty coverage, relevance domains,
