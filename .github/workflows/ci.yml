@@ -29,5 +29,8 @@ jobs:
         run: |
           python tests/test_gate.py
           python tests/test_agent_sdk_adapter.py
+          python tests/test_verifiers.py
       - name: Demo
         run: python examples/demo.py
+      - name: Preset-tuning harness self-check (lcb-gate optional; exits 0 if absent)
+        run: python examples/tune_presets.py

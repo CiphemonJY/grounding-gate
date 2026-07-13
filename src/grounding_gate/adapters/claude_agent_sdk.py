@@ -80,6 +80,22 @@ UNVERIFIED_BANNER = (
     "qualifying observation backing its claims.")
 
 
+def _progress_line(p):
+    """Compact one-line formatter for the opt-in emit_progress systemMessage.
+
+    Takes the merged ``GateHooks.progress()`` dict; uses ``.get`` so it is
+    robust to either the merged dict or the bare ``state.progress()`` dict.
+    """
+    return (
+        "[progress budget=%s/%s step=%s grounded=%s verified=%s blocks=%s/%s "
+        "rejections=%s obs=%s unmet=%s]" % (
+            p.get("budget"), p.get("cap"), p.get("step"),
+            p.get("grounded_this_turn"), p.get("verified_this_turn"),
+            p.get("blocks"), p.get("max_blocks"),
+            p.get("rejection_count"), p.get("observations_this_turn"),
+            ",".join(p.get("unmet_signals") or []) or "-"))
+
+
 def _serialize(value):
     """Deterministic text for hashing/identifier extraction."""
     if isinstance(value, str):
@@ -155,6 +171,18 @@ class GateHooks:
             ``{tool_name: callable(args, result) -> set}`` — for tools whose
             output lives in a different lexical domain than the claim
             surface (inodes, opaque handles). Receives serialized text.
+        verifier: optional ``verify_with`` verifier (a
+            ``grounding_gate.verifiers`` instance, e.g. ``StubVerifier`` or
+            ``LLMVerifier``). When set, a finish the FLOOR would accept is
+            additionally scored; a confidence below ``state.verify_threshold``
+            DOWNGRADES it to the UNVERIFIED escape path (REJECT), which flows
+            through the same block/budget/escape machinery — the verifier can
+            add strictness but can never bypass the gate or trap the agent.
+            Default None (the floor runs alone, zero-LLM).
+        emit_progress: when True, the escape-valve ``systemMessage`` is suffixed
+            with a compact ``progress()`` summary (a best-effort, user-facing
+            event per the SDK contract). Default False. The reliable programmatic
+            surface is ``progress()`` / ``exited_unverified``, not this string.
 
     Attributes:
         exited_unverified: True when the LAST allowed stop went through the
@@ -166,7 +194,8 @@ class GateHooks:
                  read_only_tools=DEFAULT_READ_ONLY_TOOLS,
                  mutating_tools=DEFAULT_MUTATING_TOOLS,
                  max_blocks=3, gate_subagents=False,
-                 normalizers=None, extractors=None):
+                 normalizers=None, extractors=None,
+                 verifier=None, emit_progress=False):
         self.state = GateState.for_model_class(
             model_class, claim_surface=set(claim_surface),
             normalizers=dict(normalizers or {}),
@@ -175,6 +204,12 @@ class GateHooks:
         self.mutating_tools = set(mutating_tools)
         self.max_blocks = max_blocks
         self.gate_subagents = gate_subagents
+        # optional verify_with tier: a verifier can DOWNGRADE a grounded finish
+        # to the UNVERIFIED escape path, never bypass the floor (see boundary.py)
+        self._verifier = verifier
+        # opt-in: append a zero-token progress summary to the escape-valve
+        # systemMessage (best-effort event; progress() is the reliable surface)
+        self.emit_progress = emit_progress
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
@@ -207,6 +242,14 @@ class GateHooks:
             self.state.budget = min(
                 self.state.budget + self.state.refill, self.state.cap)
             self.state.halted = False
+            # retain the qualifying observation for the verifier tier +
+            # telemetry, and advance the monotonic verification marker — mirrors
+            # turn_loop; classify_observation (Module 2) stays untouched
+            self.state.turn_observations.append(
+                {"tool": tool, "args": args, "result": result,
+                 "tier": "verified" if obs["grounds_completion"] else "observed"})
+            if obs["grounds_completion"]:
+                self.state.last_verification_step = self.state.current_step
         if tool in self.mutating_tools:
             self._record_mutation(tool_input)
         return {}
@@ -233,8 +276,11 @@ class GateHooks:
 
         claim_type = ("completion" if self.state.last_mutation_step > 0
                       else "assertion")
+        # forward the optional verifier: a downgrade returns REJECT and flows
+        # through the UNCHANGED block/budget/escape path below, so the agent
+        # still reaches the UNVERIFIED valve — the tier adds strictness, never a trap
         verdict = boundary_check(
-            {"claim_type": claim_type, "content": ""}, self.state)
+            {"claim_type": claim_type, "content": ""}, self.state, self._verifier)
 
         if verdict["verdict"] == ACCEPT:
             self._blocks = 0
@@ -248,9 +294,12 @@ class GateHooks:
             self._blocks = 0
             self.exited_unverified = True
             self.state.halted = False   # exit clean, like ct=="unverified"
+            if self.emit_progress:
+                return {"systemMessage":
+                        UNVERIFIED_BANNER + " " + _progress_line(self.progress())}
             return {"systemMessage": UNVERIFIED_BANNER}
 
-        return {"decision": "block", "reason": self._reason(claim_type)}
+        return {"decision": "block", "reason": self._reason(claim_type, verdict)}
 
     async def user_prompt_submit(self, input_data, tool_use_id, context):
         """UserPromptSubmit: a new turn — reset per-turn state and rope."""
@@ -258,10 +307,31 @@ class GateHooks:
         self.state.verified_this_turn = False
         self.state.halted = False
         self.state.budget = self.state.cap   # fresh rope each turn
+        self.state.turn_observations = []    # per-turn; load-bearing (else a long
+        #                                      session leaks retained observations).
+        # last_verification_step is intentionally NOT reset — it is a monotonic
+        # marker (like last_mutation_step) that telemetry reads across turns.
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
         return {}
+
+    # ------------------------------------------------------------ telemetry
+
+    def progress(self):
+        """Zero-token progress snapshot: ``state.progress()`` plus adapter-only
+        counters. This is the RELIABLE programmatic surface (like
+        ``exited_unverified``); ``emit_progress`` is only an opt-in best-effort
+        ``systemMessage`` event. Makes no tool call and no model call.
+        """
+        p = self.state.progress()
+        p.update({
+            "blocks": self._blocks,
+            "max_blocks": self.max_blocks,
+            "tool_calls_this_turn": self._tool_calls_this_turn,
+            "exited_unverified": self.exited_unverified,
+        })
+        return p
 
     # ------------------------------------------------------------ wiring
 
@@ -296,7 +366,20 @@ class GateHooks:
         # claim surface so only reads of THOSE count as verification
         self.state.claim_surface |= _mutation_identifiers(tool_input)
 
-    def _reason(self, claim_type):
+    def _reason(self, claim_type, verdict=None):
+        # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier
+        # overrode — the structural "missing" list would be EMPTY (the floor was
+        # satisfied), so give a tier-specific, actionable reason instead of the
+        # empty-parenthetical fallback (never an empty parenthetical).
+        if verdict is not None and verdict.get("downgraded_by_verifier"):
+            conf = verdict.get("confidence")
+            band = ("confidence %.2f < threshold %s" % (conf, self.state.verify_threshold)
+                    if conf is not None else "confidence < threshold")
+            return (
+                "grounding-gate REJECTED this finish (the verify_with tier could "
+                "not confirm this claim (" + band + ")). Legal next moves: "
+                "re-ground with a stronger observation and finish again, or state "
+                "explicitly that your result is UNVERIFIED.")
         missing = []
         if claim_type == "completion" and not self.state.verified_this_turn:
             missing.append(

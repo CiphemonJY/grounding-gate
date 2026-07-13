@@ -18,12 +18,14 @@ except ImportError:        # zero-install fallback: run from a raw checkout
 
 from grounding_gate import (
     ACCEPT,
+    LEGAL_NEXT,
     REJECT,
     GateState,
     boundary_check,
     classify_observation,
     turn_loop,
 )
+from grounding_gate.verifiers import StubVerifier
 
 
 def S(**kw):
@@ -346,6 +348,151 @@ def test_m1_new_mutation_invalidates_prior_verification():
     verdicts = [t[1] for t in tr if t[0] == "terminal"]
     assert verdicts == ["REJECT", "ACCEPT"]    # re-verified after 2nd write
     assert out == "done"
+
+
+# ------------------------------------------- Module 5: verify_with escalation
+# The optional verifier tier can ONLY downgrade a structural ACCEPT to the typed
+# `unverified` path; it can NEVER upgrade a structural REJECT. verifier=None is a
+# byte-identical no-op (the whole 30-case floor suite above runs with it).
+
+def test_v1_verifier_none_is_noop():
+    # a grounded assertion with no verifier accepts exactly as it does today
+    st = S(); st.grounded_this_turn = True
+    v = boundary_check({"claim_type": "assertion", "content": "x"}, st, None)
+    assert v == {"verdict": ACCEPT, "legal_next": []}
+    assert st.halted is False
+
+
+def test_v2_downgrade_of_structural_accept():
+    # floor ACCEPTs (grounded), verifier confidence 0.0 < 0.5 -> DOWNGRADE
+    st = S(); st.grounded_this_turn = True
+    v = boundary_check({"claim_type": "assertion", "content": "x"}, st, StubVerifier(0.0))
+    assert v["verdict"] == REJECT
+    assert v["downgraded_by_verifier"] is True
+    assert v["confidence"] == 0.0
+    assert v["legal_next"] == LEGAL_NEXT   # the typed-unverified path
+    assert st.halted is True
+
+
+def test_v3_verifier_cannot_upgrade_reject():
+    # UNgrounded assertion is a structural REJECT — the verifier is NEVER
+    # consulted (no downgraded flag), proving floor-first / never-upgrade
+    st = S()   # grounded_this_turn stays False
+    v = boundary_check({"claim_type": "assertion", "content": "x"}, st, StubVerifier(1.0))
+    assert v["verdict"] == REJECT
+    assert "downgraded_by_verifier" not in v
+
+
+def test_v4_unverified_immune_to_verifier():
+    # the typed escape hatch is never escalated, even by a 0.0 verifier
+    st = S()
+    v = boundary_check({"claim_type": "unverified", "content": "x"}, st, StubVerifier(0.0))
+    assert v["verdict"] == ACCEPT
+
+
+def test_v5_none_immune_to_verifier():
+    # a non-claim terminal is exempt and never escalated
+    st = S()
+    v = boundary_check({"claim_type": "none", "content": "x"}, st, StubVerifier(0.0))
+    assert v["verdict"] == ACCEPT
+
+
+def test_v6_abstain_leaves_accept():
+    # a verifier that returns None ABSTAINS -> the floor's ACCEPT stands
+    st = S(); st.grounded_this_turn = True
+    v = boundary_check({"claim_type": "assertion", "content": "x"}, st,
+                       StubVerifier(rule=lambda *a: None))
+    assert v == {"verdict": ACCEPT, "legal_next": []}
+
+
+def test_v7_turn_loop_routes_to_unverified():
+    # a grounded-completion script the FLOOR would ship, downgraded by the
+    # verifier: with only the completion terminal, nothing ships (out is None);
+    # a following typed-unverified terminal is accepted WITHOUT the verifier.
+    base = [
+        {"type": "tool_call", "tool": "write", "args": "file.txt", "result": "ok",
+         "mutating": True},
+        {"type": "tool_call", "tool": "read", "args": "file.txt", "result": "new_data"},
+        {"type": "terminal", "attempt": {"claim_type": "completion", "content": "done"}},
+    ]
+    out, tr = turn_loop(base, S(), StubVerifier(0.0))
+    assert out is None
+    assert [t[1] for t in tr if t[0] == "terminal"] == ["REJECT"]
+
+    out2, tr2 = turn_loop(base + [
+        {"type": "terminal", "attempt": {"claim_type": "unverified",
+                                         "content": "unverified: could not confirm"}},
+    ], S(), StubVerifier(0.0))
+    assert out2 == "unverified: could not confirm"
+    assert [t[1] for t in tr2 if t[0] == "terminal"] == ["REJECT", "ACCEPT"]
+
+
+def test_v8_criteria_reflect_strict_g():
+    # skipper (strict_g) routes an ACCEPTed assertion to COMPLETION-tier criteria
+    seen = {}
+
+    def rule(claim, observations, criteria):
+        seen["criteria"] = criteria
+        return 1.0
+
+    st = GateState.for_model_class("skipper", claim_surface={"file.txt"})
+    st.verified_this_turn = True   # strict-G needs verified tier to reach ACCEPT
+    boundary_check({"claim_type": "assertion", "content": "x"}, st, StubVerifier(rule=rule))
+    assert [n for n, q in seen["criteria"]] == ["effect_shown", "no_overreach"]
+
+
+# ------------------------------------------------- Module 5: progress telemetry
+
+def test_progress_shape_zero_token():
+    st = S()
+    p1 = st.progress()
+    assert set(p1) == {
+        "budget", "cap", "refill", "budget_headroom", "step",
+        "grounded_this_turn", "verified_this_turn", "rejection_count",
+        "steps_since_last_mutation", "steps_since_last_verification",
+        "halted", "observations_this_turn", "unmet_signals"}
+    assert p1["budget"] == 6 and p1["cap"] == 6 and p1["budget_headroom"] == 0
+    assert p1["steps_since_last_mutation"] is None       # never mutated
+    assert p1["steps_since_last_verification"] is None   # never verified
+    assert p1["rejection_count"] == 0
+    assert p1["observations_this_turn"] == 0
+    assert p1["unmet_signals"] == []
+    # pure function: calling again yields an equal dict, no side effects
+    assert st.progress() == p1
+
+
+def test_progress_counts_rejections():
+    st = S()   # ungrounded -> each claim-bearing boundary_check REJECTs
+    boundary_check({"claim_type": "assertion", "content": "x"}, st)
+    boundary_check({"claim_type": "assertion", "content": "x"}, st)
+    assert st.progress()["rejection_count"] == 2
+
+
+def test_progress_steps_since():
+    st = S()
+    st.current_step = 10
+    st.last_mutation_step = 4
+    st.last_verification_step = 7
+    p = st.progress()
+    assert p["steps_since_last_mutation"] == 6
+    assert p["steps_since_last_verification"] == 3
+    # a zero marker reads as None (not a bogus delta)
+    st.last_verification_step = 0
+    assert st.progress()["steps_since_last_verification"] is None
+
+
+def test_progress_after_mutate_verify_complete():
+    st = S()
+    _, _ = turn_loop([
+        {"type": "tool_call", "tool": "write", "args": "file.txt", "result": "ok",
+         "mutating": True},
+        {"type": "tool_call", "tool": "read", "args": "file.txt", "result": "new_data"},
+        {"type": "terminal", "attempt": {"claim_type": "completion", "content": "done"}},
+    ], st)
+    p = st.progress()
+    assert p["verified_this_turn"] is True
+    assert p["observations_this_turn"] >= 1
+    assert p["steps_since_last_verification"] == 0   # verified at the current step
 
 
 # ------------------------------------------------------- bare-python runner

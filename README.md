@@ -166,6 +166,46 @@ Honest scope, from the design's leak audit:
   budget is secondary (no reasoning-step hook exists there); `max_blocks` is
   the operative floor.
 
+## The verify_with verifier tier
+
+The holes above (semantic misreads, relevance spoofing, adversarial
+self-deception) are, by design, punted out of the zero-LLM floor to an
+**optional** escalation tier — the `verify_with` seam the leak audit names.
+It lives in `grounding_gate.verifiers` and is opt-in:
+
+```python
+from grounding_gate import boundary_check
+from grounding_gate.verifiers import StubVerifier          # deterministic, offline
+# from grounding_gate.verifiers.llm import LLMVerifier     # optional, needs [llm]
+
+verdict = boundary_check(attempt, state, verifier=StubVerifier(0.9))
+```
+
+- **`StubVerifier`** (stdlib, deterministic) returns a fixed score or delegates
+  to a `rule(claim, observations, criteria)` — the hermetic stand-in used
+  throughout the test suite, no network.
+- **`LLMVerifier`** (optional, `pip install grounding-gate[llm]`) is a reference
+  impl: it **decomposes** the claim into criteria and, per criterion, does
+  **repeated evaluation** — `k` independent YES/NO samples of the API's inherent
+  sampling distribution, averaged. That Monte-Carlo mean is an *estimator* of the
+  probability the source paper reads off output logits; the Anthropic Messages
+  API exposes no scoring-token logprobs, so we sample instead (cost = `k` model
+  calls, no `temperature`/`top_p`/`top_k` — they 400 on current models). The SDK
+  is imported lazily inside `LLMVerifier`, so `import grounding_gate` stays
+  stdlib-only.
+
+The wiring is **downgrade-only**: the verifier is consulted **only** at the two
+points where the structural floor already decided ACCEPT for a claim-bearing
+terminal. A confidence below `state.verify_threshold` (0.5) downgrades that
+ACCEPT to the typed `unverified` path (a `REJECT` carrying
+`downgraded_by_verifier`); an abstain (`None`) leaves the floor's ACCEPT
+standing. It is **never** consulted on a structural REJECT, nor on the
+`unverified`/`none` exits — so **the LLM can add strictness, never bypass the
+gate**, and because a downgrade reuses the ordinary `REJECT` it flows through the
+same budget/escape machinery and can never trap the agent. The floor runs first,
+independently, and zero-LLM; `verifier=None` (the default) is a byte-identical
+no-op. In the SDK adapter, pass `GateHooks(verifier=...)`.
+
 ## How this was built
 
 The modules were drafted by different LLMs and adversarially reviewed before
@@ -229,14 +269,33 @@ The gate never traps an agent.
 The adapter adds no dependency: grounding-gate stays stdlib-only, and only
 `as_options_hooks()` requires `claude-agent-sdk` to be installed.
 
+## Preset tuning
+
+Presets are starting guesses, and
+[examples/tune_presets.py](https://github.com/CiphemonJY/grounding-gate/blob/main/examples/tune_presets.py)
+is a reproducible harness for sweeping CAP/REFILL/strict-G over **seeded**
+synthetic transcripts, ranking candidates against the shipped default by
+paired-seed win-rate lower confidence bound via the sibling
+[`lcb-gate`](https://pypi.org/project/lcb-gate/)'s `compare()` (common random
+numbers). It tunes the structural floor only (no LLM), so it is offline and
+deterministic. **No "tuned" numbers are committed** — the table is regenerated
+on demand (`python examples/tune_presets.py --profile diverger --n 300`) and the
+script writes nothing; `lcb-gate` is an optional example dependency
+(`pip install grounding-gate[tuning]`) and the harness self-checks and exits 0
+when it is absent.
+
 ## Status & roadmap
 
 This is the reference implementation — correct, minimal, and framework-free.
-Shipped: the Claude Agent SDK hook adapter (above). Planned next:
+Shipped: the Claude Agent SDK hook adapter (above), the optional `verify_with`
+verifier tier (downgrade-only; `StubVerifier` + the `[llm]` `LLMVerifier`), and
+`GateState.progress()` zero-token telemetry (surfaced via
+`GateHooks.progress()` / opt-in `emit_progress`). Planned next:
 
 - Adapters: LangGraph middleware, OpenAI Agents SDK.
 - A real signal-mapper module (command exit code → declared signal).
-- Empirical preset tuning across model classes.
+- Empirical preset tuning across model classes (the harness above; committed
+  results are regenerated, never fabricated).
 
 ## License
 
