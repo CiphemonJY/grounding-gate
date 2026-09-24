@@ -86,6 +86,30 @@
   - The `sed` script matcher no longer backtracks (an 11 s input now takes
     under 1 ms); path matching is linear in the output size; a `tool_name`
     of any type no longer crashes.
+- Third independent review (18 findings: 1 high-, 8 medium-, 9
+  low-realism; 0 crashes), all pinned in `tests/test_review_findings.py`:
+  - Content counts only if it reached the agent intact: every later
+    pipeline stage must pass lines on (`cat a | wc -l | tr -d ' '` does
+    not); nothing printed means nothing shown; output from programs that
+    print only on a match (grep, diff, git diff) needs a sole producer; a
+    background `&`, a group whose output is piped or redirected, or `A || B`
+    (except `A || true`) earns no read credit; `cd x;` (not `&&`) leaves the
+    directory unknown.
+  - jq counts only for plain selectors (not `length`, `keys`, `empty`);
+    `awk '{print NF}'` and attached `-iinplace` are handled; `sed -e ... -i
+    FILE` and `--expression=` are read correctly; `git diff`/`git blame`
+    with ambiguous refs (`main feature`), `--cached` or a revision, and
+    `git grep` on the index or a branch, never verify the working tree;
+    a multi-file `git diff` credits only files in its headers.
+  - `cp` destinations are owed (ambiguous `cp a b` pays at b or b/a); glob
+    moves (`mv *.cfg archive/`) carry debt; an absolute `rm -rf /tmp/x`
+    can't clear `/p/tmp/x`.
+  - A failed Bash command still owes what it wrote (it clears nothing);
+    a failed Edit/Write owes nothing but its path stays relevant.
+  - `$(...)` inside double quotes is balanced (Claude Code's
+    `git commit -m "$(cat <<'EOF' ...)"` messages no longer invent writes);
+    substitutions inside an unquoted heredoc body make the command unknown.
+  - Path matching caches normalized forms, keeping long sessions linear.
 - CI tests every supported Python (3.9-3.13), builds the sdist/wheel with
   `twine check`, and imports the installed wheel with no extras. The release
   workflow refuses a tag that doesn't match the package version.

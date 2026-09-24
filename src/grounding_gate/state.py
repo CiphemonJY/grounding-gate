@@ -5,6 +5,7 @@ variance is absorbed as integers, not prose.
 """
 
 import fnmatch
+import functools
 import posixpath
 import re
 from dataclasses import dataclass, field
@@ -113,14 +114,18 @@ class GateState:
         self.verified_this_turn = False
         command = args.get("command") if isinstance(args, dict) else None
         if not isinstance(command, str):
+            if failed:
+                # it may have partly happened, so a read of it is relevant
+                # (and required: verification was just reset), but it isn't
+                # owed: the file may not exist, and then no read could pay
+                self.claim_surface |= mutation_identifiers(args)
+                return
             self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
             self.claim_surface |= mutation_identifiers(args)
             src, dst = (args.get("source"), args.get("destination")) \
                 if isinstance(args, dict) else (None, None)
-            if isinstance(src, str) and isinstance(dst, str) and not failed:
+            if isinstance(src, str) and isinstance(dst, str):
                 self._move(_under(cwd, src), _under(cwd, dst), None)
-            return
-        if failed:
             return
         from . import shell
         effs = shell.effects(command, cwd, output, home)
@@ -129,12 +134,21 @@ class GateState:
         for eff in effs:
             kind = eff[0]
             if kind == "write":
+                # a failed command may have stopped anywhere, but what it
+                # wrote before failing is still changed: owe it
                 self.pending_verification.add(eff[1])
                 self.claim_surface.add(eff[1])
+                if eff[2]:
+                    self.pending_aliases[eff[1]] = eff[2]
+                    self.claim_surface.add(eff[2])
+            elif failed:
+                continue       # its removes, moves and reads may not have run
             elif kind == "remove":
                 for e in _removed({eff[1]}, self.pending_verification, eff[2],
                                   self.pending_aliases):
                     self._drop(e)
+            elif kind == "move" and eff[3] == "*glob*":
+                self._move_glob(eff[1], eff[2])
             elif kind == "move":
                 self._move(*eff[1:])
             elif kind == "read":
@@ -145,6 +159,8 @@ class GateState:
         last_change = max((k for k, e in enumerate(effs) if e[0] != "read"),
                           default=-1)
         trailing = {e[1] for e in effs[last_change + 1:] if e[0] == "read"}
+        if failed:
+            return
         if trailing and not self.pending_verification and surface_hits(
                 trailing, self.claim_surface):
             self.verified_this_turn = True
@@ -161,6 +177,16 @@ class GateState:
                     if e in self.pending_verification}
         hits |= {by_alias[a] for a in surface_hits(idents, set(by_alias))}
         return hits
+
+    def _move_glob(self, pattern, target_dir):
+        """``mv *.cfg archive/``: owed entries the pattern matches move into
+        the directory under their own names."""
+        for e in list(self.pending_verification):
+            if _removes_path({pattern}, e, recursive=False):
+                self._drop(e)
+                new = posixpath.join(target_dir, posixpath.basename(e))
+                self.pending_verification.add(new)
+                self.claim_surface.add(new)
 
     def _move(self, src, dst, alt):
         """Carry debt from ``src`` (a file, or a directory holding owed
@@ -341,6 +367,7 @@ def extract_identifiers(args, result):
     return set(re.findall(r"[\w.\-/]+", f"{args} {result}"))
 
 
+@functools.lru_cache(maxsize=65536)
 def _canonical(ident):
     while ident.startswith("./"):
         ident = ident[2:]
@@ -385,10 +412,15 @@ def surface_hits(idents, surface):
             continue
         # an identifier that is a tail of the surface path ("app.cfg" for
         # "/srv/proj/app.cfg")
-        parts = s.split("/")
-        if any("/".join(parts[k:]) in idents for k in range(1, len(parts))):
+        if not idents.isdisjoint(_tails(s)):
             hits.add(entry)
     return hits
+
+
+@functools.lru_cache(maxsize=65536)
+def _tails(path):
+    parts = path.split("/")
+    return frozenset("/".join(parts[k:]) for k in range(1, len(parts)))
 
 
 # tool_input keys whose VALUES name what was touched
@@ -489,6 +521,10 @@ def _removes_path(operands, path, recursive):
             continue
         if surface_hits({operand}, {path}):
             return True
-        if recursive and ("/" + op.strip("/") + "/") in ("/" + cpath):
-            return True
+        if recursive:
+            if op.startswith("/") and cpath.startswith("/"):
+                if cpath.startswith(op.rstrip("/") + "/"):
+                    return True
+            elif ("/" + op.strip("/") + "/") in ("/" + cpath):
+                return True
     return False

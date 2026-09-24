@@ -299,6 +299,114 @@ def test_round2_pathological_input_is_fast():
     assert time.perf_counter() - start < 0.5
 
 
+# ------------------------------------------------- third review round
+
+def fail(command):
+    return ("__fail__", {"command": command})
+
+
+def go3(*steps, cwd="/p", home="/home/u"):
+    gate = GateHooks(home=home)
+    for step in steps:
+        if step[0] == "__fail__":
+            drive(gate.post_tool_use_failure(
+                {"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                 "tool_input": step[1], "error": "exit 1", "cwd": cwd}, None, None))
+        elif step[0] == "__fail_edit__":
+            drive(gate.post_tool_use_failure(
+                {"hook_event_name": "PostToolUseFailure", "tool_name": step[1],
+                 "tool_input": step[2], "error": "no such file", "cwd": cwd}, None, None))
+        else:
+            drive(gate.post_tool_use(ptu(*step, cwd=cwd), None, None))
+    out = drive(gate.stop(STOP, None, None))
+    return ("ACCEPT" if out == {} else "REJECT"), sorted(gate.state.pending_verification)
+
+
+A, B_ = "/p/a.cfg", "/p/b.cfg"
+COMMIT = "git commit -am \"$(cat <<'EOF'\n{msg}\nEOF\n)\""
+
+LEAKS_3 = {
+    "F1 a failing command still owes what it wrote": (
+        edit(B_), read(B_), fail("sed -i 's/30/60/' a.cfg && pytest -q"), read(B_, "b=2")),
+    "F1b failing redirect then make": (
+        edit(B_), read(B_), fail("echo t=60 > a.cfg && make test"), read(B_, "b=2")),
+    "F3 a count in the middle of a pipeline": (edit(A), bash_dict("cat a.cfg | wc -l | tr -d ' '", "12")),
+    "F3b checksum then cut": (edit(A), bash_dict("cat a.cfg | sha256sum | cut -c1-12", "ab12")),
+    "F3c grep -c then tr": (edit(A), bash_dict("grep -c timeout a.cfg | tr -d '\\n'", "1")),
+    "F4 jq empty": (edit("/p/a.json"), bash_dict("jq empty a.json && echo ok", "ok")),
+    "F4b jq length": (edit("/p/a.json"), bash_dict("jq length a.json", "3")),
+    "F4c jq keys": (edit("/p/a.json"), bash_dict("jq -r 'keys[]' a.json", "name")),
+    "F5 multi-file grep with no line from a.cfg": (
+        edit(A), bash_dict("grep -n timeout a.cfg b.cfg", "b.cfg:3:timeout=1")),
+    "F5b grep || echo": (edit(A), bash_dict("grep -n old_key a.cfg || echo none", "none")),
+    "F5c untracked file in a multi-file git diff": (
+        ("Write", {"file_path": "/p/new.py", "content": "x"}), edit("/p/b.py"),
+        bash_dict("git diff -- new.py b.py", "+++ b/b.py\n+x")),
+    "F5d identical files print nothing": (edit(A), bash_dict("diff a.cfg a.cfg.orig", "")),
+    "F5e cat after || never ran": (edit(B_), read(B_), bash_dict("sed -i s/1/2/ a.cfg || cat a.cfg", "")),
+    "F6 diff headers only": (edit(A), bash_dict("git diff | grep '^+++'", "+++ b/a.cfg")),
+    "F6b grep prefixes cut down": (edit(A), bash_dict("grep -rn timeout . | cut -d: -f1,2", "./a.cfg:1")),
+    "F7 cp overwrites unseen": (
+        edit(A), edit(B_), read(A), read(B_), bash("cp /tmp/x.cfg a.cfg"), read(B_, "b=2")),
+    "F10 group piped into wc": (edit(A), bash_dict("{ cat a.cfg; cat b.cfg; } | wc -l", "12")),
+    "F10b subshell piped into wc": (edit(A), bash_dict("(cat a.cfg; cat b.cfg) | wc -l", "12")),
+    "F10c group to /dev/null": (edit(A), bash_dict("{ cat a.cfg; } > /dev/null", "")),
+    "F11 git diff between two branches": (
+        edit(A), bash_dict("git diff main feature a.cfg", "+++ b/a.cfg\n+t=1")),
+    "F11b git diff origin/main HEAD": (
+        edit(A), bash_dict("git diff origin/main HEAD", "+++ b/a.cfg\n+t=1")),
+    "F12 git blame at a revision": (edit(A), bash_dict("git blame HEAD~3 a.cfg", "abc t=1")),
+    "F12b git grep --cached": (edit(A), bash_dict("git grep --cached -n timeout -- a.cfg", "a.cfg:1:t")),
+    "F12c git grep on a branch": (edit(A), bash_dict("git grep -n timeout main -- a.cfg", "main:a.cfg:1:t")),
+    "F13 sed -e ... -i .env": (
+        edit(B_), read(B_), bash("sed -e 's/x/y/' -i .env"), read(B_, "b=3")),
+    "F13b sed -i --expression=": (
+        edit(B_), read(B_), bash("sed -i --expression='s/x/y/' a.cfg"), read(B_, "b=3")),
+    "F14 awk -iinplace": (edit(A), bash_dict("awk -iinplace '{sub(/30/,\"60\")}1' a.cfg", "")),
+    "F14b awk print NF": (edit(A), bash_dict("awk '{print NF}' a.cfg", "2")),
+    "F15 substitution in a heredoc body": (
+        edit(A), read(A), bash_dict("cat <<EOF\n$(sed -i s/x/y/ a.cfg)\nEOF", "")),
+    "F16 rm -rf /tmp/cache is not /p/tmp/cache": (
+        ("Write", {"file_path": "/p/tmp/cache/x.json", "content": "{}"}), edit(B_),
+        bash("rm -rf /tmp/cache"), read(B_, "b=1")),
+    "F17 background edit races the read": (edit(A), bash_dict("sed -i s/1/2/ a.cfg & cat a.cfg", "t=1")),
+    "F17b cd that may have failed": (edit("/p/sub/a.cfg"), bash_dict("cd sub; cat a.cfg", "t=1")),
+}
+
+TRAPS_3 = {
+    "F2 commit message with a quoted phrase": (
+        edit(A), read(A), bash(COMMIT.format(msg='Use "->" for returns')), read(A, "t=2")),
+    "F2b commit message with >=": (
+        edit(A), read(A), bash(COMMIT.format(msg='Support "x >= 2" check')), read(A, "t=2")),
+    "F7b cp creates a file": (bash("cp .env.example .env"), bash_dict("cat .env", "K=1")),
+    "F7c cp restores a file": (bash("cp a.cfg.bak a.cfg"), read(A, "t=1")),
+    "F8 glob move into a directory": (edit(A), bash("mv *.cfg archive/"), read("/p/archive/a.cfg")),
+    "F9 failed Edit of a missing file": (
+        ("__fail_edit__", "Edit", {"file_path": "/p/src/config.py"}),
+        edit("/p/config.py"), read("/p/config.py")),
+}
+
+
+def test_round3_leaks_are_rejected():
+    for name, steps in LEAKS_3.items():
+        assert go3(*steps)[0] == "REJECT", name
+
+
+def test_round3_traps_are_accepted():
+    for name, steps in TRAPS_3.items():
+        assert go3(*steps) == ("ACCEPT", []), name
+
+
+def test_round3_long_sessions_stay_fast():
+    import time
+    gate = GateHooks(home="/home/u")
+    start = time.perf_counter()
+    for i in range(1500):
+        drive(gate.post_tool_use(ptu("Write", {"file_path": "/p/f%d.cfg" % i}), None, None))
+        drive(gate.post_tool_use(ptu("Bash", {"command": "cat f%d.cfg" % i}, "x"), None, None))
+    assert time.perf_counter() - start < 3.0
+
+
 def test_T8_git_diff_headers_are_repo_relative():
     verdict = go(edit("/repo/pkg/m.py"),
                  bash("git diff", "--- a/pkg/m.py\n+++ b/pkg/m.py\n+x=2"), cwd="/repo/pkg")

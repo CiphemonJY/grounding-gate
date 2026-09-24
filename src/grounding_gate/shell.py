@@ -59,9 +59,9 @@ def _read_balanced(text, i):
 
 
 def _read_word(text, i):
-    """``(word, end)`` for a heredoc delimiter starting at ``i``: quotes are
-    honoured (``'END X'`` is one word) and removed."""
-    out = []
+    """``(word, end, quoted)`` for a heredoc delimiter starting at ``i``:
+    quotes are honoured (``'END X'`` is one word) and removed."""
+    out, quoted = [], False
     n = len(text)
     while i < n and text[i] not in " \t\n;&|<>()":
         c = text[i]
@@ -70,14 +70,16 @@ def _read_word(text, i):
             if j < 0:
                 raise ValueError("unterminated quote in heredoc delimiter")
             out.append(text[i + 1:j])
+            quoted = True
             i = j + 1
         elif c == "\\" and i + 1 < n:
             out.append(text[i + 1])
+            quoted = True
             i += 2
         else:
             out.append(c)
             i += 1
-    return "".join(out), i
+    return "".join(out), i, quoted
 
 
 def tokenize(command):
@@ -91,7 +93,7 @@ def tokenize(command):
     if len(command) > _MAX_COMMAND:
         raise ValueError("command too long to analyse")
     tokens, word, in_word, subst = [], [], False, False
-    heredocs = []          # (delimiter, strip_tabs) awaiting the next newline
+    heredocs = []          # (delimiter, strip_tabs, quoted) awaiting a newline
     i, n = 0, len(command)
 
     def end_word():
@@ -109,7 +111,7 @@ def tokenize(command):
             tokens.append(("op", ";"))
             i += 1
             while heredocs:
-                delim, strip_tabs = heredocs.pop(0)
+                delim, strip_tabs, quoted = heredocs.pop(0)
                 while True:
                     if i >= n:
                         raise ValueError("unterminated heredoc")
@@ -118,6 +120,9 @@ def tokenize(command):
                     i = n if j < 0 else j + 1
                     if (line.lstrip("\t") if strip_tabs else line) == delim:
                         break
+                    if not quoted and ("$(" in line or "`" in line):
+                        # an unquoted heredoc body runs its substitutions
+                        raise ValueError("substitution in heredoc body")
             continue
         if c in " \t\r":
             end_word()
@@ -172,8 +177,21 @@ def tokenize(command):
                     word.append(command[i + 1])
                     i += 2
                     continue
-                if d == "`" or command.startswith("$(", i):
+                if command.startswith("$(", i):
+                    # quotes inside $(...) don't end the outer string
+                    j = _read_balanced(command, i + 2)
+                    word.append(command[i:j])
                     subst = True
+                    i = j
+                    continue
+                if d == "`":
+                    j = command.find("`", i + 1)
+                    if j < 0:
+                        raise ValueError("unterminated backtick")
+                    word.append(command[i:j + 1])
+                    subst = True
+                    i = j + 1
+                    continue
                 word.append(d)
                 i += 1
             in_word = True
@@ -221,8 +239,8 @@ def tokenize(command):
             if redir in ("<<", "<<-"):
                 while i < n and command[i] in " \t":
                     i += 1
-                delim, i = _read_word(command, i)
-                heredocs.append((delim, redir == "<<-"))
+                delim, i, quoted = _read_word(command, i)
+                heredocs.append((delim, redir == "<<-", quoted))
                 tokens.append(("word", _Word(delim)))
             continue
         op = next((o for o in _OPERATORS if command.startswith(o, i)), None)
@@ -242,6 +260,13 @@ def tokenize(command):
 
 # ----------------------------------------------------------------- stages
 
+class Stages(list):
+    """The stages of a command. ``grouped_output`` is True when a group's
+    output (``{ ...; }``, ``( ... )``, ``if ... fi``) is piped or redirected
+    as a whole: what its stages printed never reached the agent directly."""
+    grouped_output = False
+
+
 class Stage:
     """One simple command: ``argv`` (env assignments, keywords and
     ``sudo``/``time`` style prefixes removed), its redirects as
@@ -250,10 +275,10 @@ class Stage:
     previous one, and the directory and home relative paths resolve
     against."""
 
-    def __init__(self, argv, redirects, subst, piped, piped_in, cwd, home):
+    def __init__(self, argv, redirects, subst, piped, piped_in, cwd, home, sep=";"):
         self.argv, self.redirects, self.subst = argv, redirects, subst
         self.piped, self.piped_in = piped, piped_in
-        self.cwd, self.home = cwd, home
+        self.cwd, self.home, self.sep = cwd, home, sep
 
     def resolve(self, path):
         return resolve(path, self.cwd, self.home)
@@ -321,20 +346,22 @@ def parse(command, cwd="", home=None):
     except ValueError:
         return None
     base = posixpath.normpath(cwd) if cwd else ("" if cwd == "" else None)
-    stages, saved, dirstack = [], [], []
+    stages, saved, dirstack = Stages(), [], []
     argv, redirects, subst = [], [], False
-    expect_target, piped_in = None, False
+    expect_target, piped_in, just_closed = None, False, False
 
     def flush(sep):
         nonlocal argv, redirects, subst, base, piped_in
         piped = sep in ("|", "|&")
+        if argv and argv[0] in _CLOSERS and (piped or redirects):
+            stages.grouped_output = True
         words = argv
         while words and (_ASSIGNMENT.match(words[0]) or words[0] in _PREFIXES):
             words = words[1:]
         words = [w for w in words if w not in _CLOSERS]
         if words or redirects or subst:
             stages.append(Stage(list(words), redirects, subst, piped, piped_in,
-                                base, home))
+                                base, home, sep))
             name = words[0] if words else ""
             if name in ("cd", "pushd", "popd") and not piped and sep != "&" \
                     and not piped_in:
@@ -344,11 +371,17 @@ def parse(command, cwd="", home=None):
                     target = _cd_target(words)
                     if name == "pushd":
                         dirstack.append(base)
-                    base = None if target == "-" else resolve(target, base, home)
+                    # after `cd x;` the next command runs even if cd failed,
+                    # so only `cd x && ...` pins where it runs
+                    base = None if target == "-" or sep != "&&" \
+                        else resolve(target, base, home)
         piped_in = piped
         argv, redirects, subst = [], [], False
 
     for kind, value in tokens:
+        if just_closed and (kind == "redir" or value in ("|", "|&")):
+            stages.grouped_output = True
+        just_closed = False
         if expect_target is not None:
             fd, op = expect_target
             expect_target = None
@@ -368,6 +401,7 @@ def parse(command, cwd="", home=None):
             flush(";")
             if saved:
                 base = saved.pop()
+            just_closed = True
         else:                                    # | |& ; && || & ;;
             flush(value)
     flush(";")
@@ -501,20 +535,26 @@ def _short_flags(opts):
 def _sed_parts(args):
     """``(in_place, scripts, files)`` for a sed argument list. Any short
     bundle with ``i`` (``-ni``, ``-Ei``) edits in place; BSD ``-i ''`` and
-    ``-i .bak`` take a separate backup suffix."""
+    ``-i .bak`` take a separate backup suffix, recognised only when a
+    script and a file still follow it (``-e s/x/y/ -i .env`` edits .env)."""
     in_place, scripts, files, has_e, k = False, [], [], False, 0
+    has_e = any(a in ("-e", "--expression", "-f", "--file")
+                or a.startswith("--expression=") or a.startswith("--file=")
+                for a in args)
     while k < len(args):
         a = args[k]
         if a in ("-e", "--expression"):
-            has_e = True
             if k + 1 < len(args):
                 scripts.append(args[k + 1])
             k += 2
             continue
-        if a in ("-f", "--file"):
+        if a.startswith("--expression="):
+            scripts.append(a.split("=", 1)[1])
+            k += 1
+            continue
+        if a in ("-f", "--file") or a.startswith("--file="):
             scripts.append(None)          # a script file: unknown commands
-            has_e = True
-            k += 2
+            k += 1 if "=" in a else 2
             continue
         if a.startswith("--in-place"):
             in_place = True
@@ -522,9 +562,12 @@ def _sed_parts(args):
             continue
         if a.startswith("-") and not a.startswith("--") and "i" in a[1:]:
             in_place = True
-            if a == "-i" and k + 1 < len(args) and (
-                    args[k + 1] == "" or re.match(r"^\.[\w.-]{1,16}$", args[k + 1])):
-                k += 1                    # BSD/macOS backup suffix
+            if a == "-i" and k + 1 < len(args):
+                nxt = args[k + 1]
+                following = [x for x in args[k + 2:] if not x.startswith("-")]
+                if nxt == "" or (re.match(r"^\.[\w.-]{1,16}$", nxt)
+                                 and len(following) >= (1 if has_e else 2)):
+                    k += 1                # BSD/macOS backup suffix
             k += 1
             continue
         if a.startswith("-") and a != "-":
@@ -538,23 +581,40 @@ def _sed_parts(args):
 
 
 def _awk_parts(args):
-    """``(safe, files)``: awk whose program can only print (no ``-f``
-    script, no ``-i inplace``, no redirection/pipe/system/getline and no
-    BEGIN/END summary), and the files it reads."""
+    """``(safe, files, shows_lines)``: awk whose program can only print (no
+    ``-f`` script, no in-place extension, no redirection/pipe/system/getline
+    and no BEGIN/END summary), the files it reads, and whether what it
+    prints is file text (fields, or whole lines) rather than a count."""
     opts, ops = _split_args("awk", args)
-    if any(flag in ("-f", "-i", "-E", "--file", "--include") or
-           flag.startswith("--") for flag, _ in opts):
-        return False, []
+    if any(flag.startswith("-i") or flag.startswith("-f") or flag.startswith("-E")
+           or flag.startswith("--") for flag, _ in opts):
+        return False, [], False
     if not ops:
-        return False, []
+        return False, [], False
     program = ops[0]
-    return len(program) <= 2000 and not _AWK_UNSAFE.search(program), ops[1:]
+    safe = len(program) <= 2000 and not _AWK_UNSAFE.search(program)
+    prints = re.findall(r"\bprintf?\b([^;}]*)", program)
+    return safe, ops[1:], all("$" in p for p in prints)
 
 
 def _sed_prints_only(script):
     if script is None or len(script) > 500:
         return False
     return bool(_SED_PRINT_ONLY.match(re.sub(r"\s+", "", script)))
+
+
+_JQ_SELECTOR = re.compile(r"^\s*\.[\w\[\]\.\"'-]*(?:\s*\|\s*\.[\w\[\]\.\"'-]*)*\s*$")
+
+
+def _jq_shows_content(args):
+    """jq prints file text only for plain selectors (``.``, ``.a.b``,
+    ``.items[] | .name``); ``length``, ``keys``, ``type``, ``empty`` and
+    other functions print a derived value."""
+    opts, ops = _split_args("jq", args)
+    if any(f in ("-f", "--from-file", "-e", "--exit-status", "-n", "--null-input")
+           for f, _ in opts) or not ops:
+        return False
+    return bool(_JQ_SELECTOR.match(ops[0]))
 
 
 def _is_viewer(name, args):
@@ -589,15 +649,27 @@ def _shows_content(name, args):
         return False
     opts, _ = _split_args(name, args)
     flags = {f.split("=", 1)[0] for f, _ in opts}
+    if name == "jq":
+        return _jq_shows_content(args)
     if name in _PATTERN:
-        return not (flags & _QUIET_LONG or _short_flags(opts) & _QUIET_SHORT)
+        return not (flags & _QUIET_LONG or _short_flags(opts) & _QUIET_SHORT
+                    or "o" in _short_flags(opts) or "--only-matching" in flags)
     if name in ("diff", "git diff"):
         return not flags & _DIFF_SUMMARY
-    if name in ("sed", "awk", "json.tool"):
+    if name == "sort":
+        return not _short_flags(opts) & set("cC") and "--check" not in flags
+    if name == "awk":
+        safe, _, lines = _awk_parts(args)
+        return safe and lines
+    if name in ("sed", "json.tool"):
         return _is_viewer(name, args)
     return name in _PASS_THROUGH or name == "git blame"
 
 
+# a later pipeline stage that passes the earlier stage's lines on intact
+# (possibly fewer of them); cut, tr, wc, jq and the like transform them
+_PRESERVES = frozenset({"cat", "head", "tail", "grep", "egrep", "fgrep", "rg",
+                        "sort", "nl", "less", "more", "sed", "json.tool"})
 def _harmless_target(op, target):
     """Redirect targets that write no file: /dev/*, fd dups, closing."""
     return (target.startswith("/dev/") or target == "-"
@@ -640,23 +712,29 @@ _OUTPUT_PATH = re.compile(r"^([^\s:]+):", re.M)
 
 
 def _pattern_parts(name, args):
-    """``(files, prints_filenames, has_revision)`` for grep/rg/jq/git grep."""
+    """``(files, prints_filenames, not_worktree)`` for grep/rg/jq/git grep.
+    ``not_worktree``: a git grep of the index or of a revision."""
     opts, ops = _split_args(name, args)
     flags = {f.split("=", 1)[0] for f, _ in opts}
     if not any(f in ("-e", "-f", "--regexp", "--file") for f in flags):
         ops = ops[1:]                              # the first operand is the pattern
-    revision = name == "git grep" and any(_REVISION.search(o) for o in ops)
+    if name == "git grep":
+        # anything between the pattern and `--` is a revision
+        before = args[:args.index("--")] if "--" in args else args
+        revs = _split_args(name, before)[1][1:]
+        paths = args[args.index("--") + 1:] if "--" in args else []
+        return paths, True, bool(revs) or "--cached" in flags
     if name == "jq":
         return ops, False, False
     shorts = _short_flags(opts)
     if "h" in shorts or "--no-filename" in flags:
-        return ops, False, revision
-    if name == "git grep" or "H" in shorts or "--with-filename" in flags:
-        return ops, True, revision
+        return ops, False, False
+    if "H" in shorts or "--with-filename" in flags:
+        return ops, True, False
     recursive = bool(shorts & set("rR")) or "--recursive" in flags
     if name == "rg":
-        return ops, (len(ops) != 1 or recursive), revision
-    return ops, recursive or len(ops) > 1, revision
+        return ops, (len(ops) != 1 or recursive), False
+    return ops, recursive or len(ops) > 1, False
 
 
 def _within(path, roots):
@@ -665,61 +743,74 @@ def _within(path, roots):
                for r in roots)
 
 
-def _git_diff_worktree(args):
-    """``git diff`` whose ``+`` side is the working tree: not ``--cached``,
-    and at most one revision (``git diff A B`` and ranges compare commits)."""
+def _git_revs_and_paths(args):
+    """``(revisions, paths)`` for git diff/blame arguments; without ``--``
+    two or more operands are ambiguous (branch names look like paths), so
+    they come back as ``None``."""
     opts, ops = _split_args("git diff", args)
-    if {f.split("=", 1)[0] for f, _ in opts} & {"--cached", "--staged"}:
-        return False, []
     if "--" in args:
-        revs = [o for o in args[:args.index("--")] if not o.startswith("-")]
-        paths = args[args.index("--") + 1:]
-    else:
-        revs = [o for o in ops if _REVISION.search(o)]
-        paths = [o for o in ops if not _REVISION.search(o)]
-    if len(revs) > 1 or any(".." in r for r in revs):
-        return False, []
-    return True, paths
+        before = args[:args.index("--")]
+        return _split_args("git diff", before)[1], args[args.index("--") + 1:]
+    if len(ops) >= 2:
+        return None, None
+    revs = [o for o in ops if _REVISION.search(o)]
+    return revs, [o for o in ops if o not in revs]
 
 
 def _stage_reads(stage, output, attribute):
     """``(content, listed)`` paths one read-only stage looked at.
 
     ``attribute`` says whether this stage is the command's only producer of
-    output, so ``path:`` prefixes and diff headers in the output can be
-    trusted to be its own.
+    output, so the output (its emptiness, ``path:`` prefixes, diff headers)
+    can be trusted to be its own. Programs that print only when something
+    matched (grep, diff, git diff) earn content credit only then.
     """
     name, args, cwd = _program(stage)
     content, listed = [], []
     ops = _split_args(name, args)[1]
+    printed = bool((output or "").strip())
     if stage.stdout_redirected:
         return set(), set()
     if name in _PATTERN:
-        files, prefixes, revision = _pattern_parts(name, args)
-        if revision:
+        files, prefixes, not_worktree = _pattern_parts(name, args)
+        if not_worktree:
             return set(), set()
-        content = [f for f in files if f != "-"]
-        if prefixes and attribute and not stage.piped_in:
-            roots = [resolve(f, cwd, stage.home) for f in files] or [cwd or ""]
-            for p in _OUTPUT_PATH.findall(output or ""):
-                r = resolve(p, cwd, stage.home)
-                if r and _within(r, [x for x in roots if x is not None]) \
-                        and ("/" in p or "." in p):
-                    content.append(p)
+        if prefixes:
+            # several files or a recursive search: only files whose lines
+            # were printed, and only when this stage printed everything
+            if attribute and not stage.piped_in:
+                roots = [resolve(f, cwd, stage.home) for f in files] or [cwd or ""]
+                for p in _OUTPUT_PATH.findall(output or ""):
+                    r = resolve(p, cwd, stage.home)
+                    if r and _within(r, [x for x in roots if x is not None]) \
+                            and ("/" in p or "." in p):
+                        content.append(p)
+        elif attribute and printed:
+            content = [f for f in files if f != "-"]
     elif name == "sed":
         content = _sed_parts(args)[2]
     elif name == "awk":
         content = _awk_parts(args)[1]
-    elif name == "git diff":
-        worktree, paths = _git_diff_worktree(args)
-        # an untracked or unchanged file prints nothing: nothing was seen
-        if worktree and (output or "").strip():
-            content = list(paths)
-            if attribute:
-                content += ["\0" + p for p in _DIFF_NEW_FILE.findall(output)
-                            if p != "/dev/null"]
-    elif name in ("git show", "git grep"):
-        content = []                           # committed copies / handled above
+    elif name in ("git diff", "git blame"):
+        revs, paths = _git_revs_and_paths(args)
+        worktree = paths is not None and not (
+            {f.split("=", 1)[0] for f, _ in _split_args(name, args)[0]}
+            & {"--cached", "--staged"})
+        if name == "git diff":
+            worktree = worktree and len(revs) <= 1
+        else:
+            worktree = worktree and not revs
+        if worktree and attribute and printed:
+            headers = [h for h in _DIFF_NEW_FILE.findall(output) if h != "/dev/null"]
+            if headers and name == "git diff":
+                content = ["\0" + h for h in headers]   # only files it showed
+            elif len(paths) == 1:
+                content = list(paths)
+    elif name == "git show":
+        content = []                           # committed copies, never the tree
+    elif name == "diff":
+        if attribute and printed:
+            content = [o for o in ops if o != "-"]
     elif name in _CONTENT:
         content = [o for o in ops if o != "-"]
     elif name in _LISTING:
@@ -767,30 +858,77 @@ def _pipelines(stages):
     return groups
 
 
+def _pipeline_shows(pipe):
+    """Whether a pipeline's first stage's lines reach the agent intact:
+    the producer prints file text, and every later stage passes lines on
+    (``cat a | grep x`` does; ``cat a | wc -l | tr -d ' '`` does not)."""
+    name, args, _ = _program(pipe[0])
+    if not _shows_content(name, args):
+        return False
+    for stage in pipe[1:]:
+        later, largs, _ = _program(stage)
+        if later not in _PRESERVES or not _shows_content(later, largs) \
+                or stage.redirects:
+            return False
+    return not any(s.stdout_redirected for s in pipe)
+
+
+def _silent(pipe):
+    """``true`` / ``:``: a pipeline that prints nothing."""
+    return len(pipe) == 1 and pipe[0].argv[:1] in (["true"], [":"]) \
+        and not pipe[0].redirects
+
+
+def _sole_producer(pipes):
+    """The one single-stage pipeline that printed everything, if any."""
+    producers = [p for p in pipes if not _silent(p)]
+    if len(producers) == 1 and len(producers[0]) == 1:
+        return producers[0]
+    return None
+
+
+def _credited_pipelines(stages):
+    """Pipelines whose reads can be credited: none in a command that runs
+    anything in the background (the read may race the write) or whose
+    group output is redirected; none joined by ``||`` (one side failed or
+    never ran), except ``A || true``, where only A can have printed."""
+    pipes = _pipelines(stages)
+    if stages.grouped_output or any(s.sep == "&" for s in stages):
+        return pipes, set()
+    ok, prev = set(), ";"
+    for k, pipe in enumerate(pipes):
+        after = pipes[k + 1] if k + 1 < len(pipes) else None
+        joined = pipe[-1].sep == "||" and not (after and _silent(after))
+        if prev != "||" and not joined:
+            ok.add(k)
+        prev = pipe[-1].sep
+    return pipes, ok
+
+
 def read_operands(command, output="", cwd="", home=None):
     """``(content, listed)``: paths a read-only command showed the content
     of, and paths it only listed or summarized.
 
-    A pipeline counts as showing content only if its last stage passes lines
-    through to the agent (``cat a | grep x`` does; ``cat a | wc -l``,
-    ``grep -q``, ``git diff --stat`` and ``> /dev/null`` do not); what it
-    read is then demoted to listed. File names printed in the output (grep's
-    ``path:`` prefixes, diff headers) are trusted only when one stage is the
-    whole command's output and they fall under what it searched.
+    A pipeline counts as showing content only if its producer prints file
+    text and every later stage passes those lines on (``cat a | grep x``
+    does; ``cat a | wc -l``, ``grep -q``, ``jq length``, ``git diff --stat``
+    and ``> /dev/null`` do not); what it read is then demoted to listed.
+    Output (emptiness, ``path:`` prefixes, diff headers) is trusted only
+    when one stage produced all of it, and nothing is shown if nothing
+    was printed.
     """
-    stages = parse(command, cwd, home) or []
-    pipelines = _pipelines(stages)
-    attribute = len(pipelines) == 1 and len(pipelines[0]) >= 1
+    stages = parse(command, cwd, home) or Stages()
+    pipes, credited = _credited_pipelines(stages)
+    printed = bool((output or "").strip())
+    sole = _sole_producer(pipes)
     content, listed = set(), set()
-    for pipe in pipelines:
+    for k, pipe in enumerate(pipes):
         pipe_content, pipe_listed = set(), set()
-        for k, stage in enumerate(pipe):
-            # only the pipeline's first stage produces output of its own
-            c, l_ = _stage_reads(stage, output, attribute and k == 0)
+        for j, stage in enumerate(pipe):
+            c, l_ = _stage_reads(stage, output, pipe is sole)
             pipe_content |= c
             pipe_listed |= l_
-        name, args, _ = _program(pipe[-1])
-        if _shows_content(name, args) and not pipe[-1].stdout_redirected:
+        if k in credited and printed and _pipeline_shows(pipe):
             content |= pipe_content
         else:
             listed |= pipe_content
@@ -800,11 +938,50 @@ def read_operands(command, output="", cwd="", home=None):
 
 # ---------------------------------------------------------------- effects
 
+def _copy_targets(name, args, cwd, home):
+    """``(dst, alt)`` per file a ``cp`` writes (alt: the other reading of an
+    ambiguous ``cp a b``, b possibly a directory). Glob or variable sources
+    into a directory can't be named: nothing is owed for them."""
+    target_dir, ops, k = None, [], 0
+    while k < len(args):
+        a = args[k]
+        if a in ("-t", "--target-directory") and k + 1 < len(args):
+            target_dir = args[k + 1]
+            k += 2
+            continue
+        if a.startswith("--target-directory="):
+            target_dir = a.split("=", 1)[1]
+        elif not a.startswith("-"):
+            ops.append(a)
+        k += 1
+    if target_dir is None:
+        if len(ops) < 2:
+            return []
+        *sources, target = ops
+    else:
+        sources, target = ops, target_dir
+    out = []
+    for s in sources:
+        if set(s) & set("*?[$`"):
+            continue
+        inside = posixpath.join(target, posixpath.basename(s.rstrip("/")))
+        if target_dir is not None or len(sources) > 1:
+            dst, alt = inside, None
+        elif target.endswith("/"):
+            dst, alt = inside, None
+        else:
+            dst, alt = target, inside
+        dst = resolve(dst, cwd, home)
+        if dst:
+            out.append((dst, resolve(alt, cwd, home) if alt else None))
+    return out
+
+
 def _writes(stage):
-    """Files a stage writes: stdout/both redirects (stderr logs are not the
-    edit), ``tee`` operands, ``sed -i`` files, ``sort -o``. Targets that
-    can't be placed (devices, process substitutions, variables) are never
-    owed: no read could pay them."""
+    """``(path, alt)`` per file a stage writes: stdout/both redirects
+    (stderr logs are not the edit), ``tee`` operands, ``sed -i`` files,
+    ``sort -o``, ``cp`` destinations. Targets that can't be placed (devices,
+    process substitutions, variables) are never owed: no read could pay."""
     name, args, cwd = _program(stage)
     out = []
     for fd, op, target in stage.redirects:
@@ -825,14 +1002,18 @@ def _writes(stage):
         if not set(p) & set("*?[") and not _harmless_target(">", p):
             r = resolve(p, cwd, stage.home)
             if r:
-                placed.append(r)
+                placed.append((r, None))
+    if name == "cp":
+        placed += _copy_targets(name, args, cwd, stage.home)
     return placed
 
 
 def _moves(stage):
     """``(src, dst, alt)`` per moved file; ``alt`` is the other reading of
     an ambiguous move (``mv a b`` where b may be a directory, or
-    ``mv src/ lib/`` where lib may not exist yet)."""
+    ``mv src/ lib/`` where lib may not exist yet). A glob source moved into
+    a directory comes back with ``src`` as the (resolved) pattern and
+    ``dst`` as the directory, flagged by ``alt`` being ``"*glob*"``."""
     name, args, cwd = _program(stage)
     if name not in ("mv", "git mv"):
         return []
@@ -856,7 +1037,12 @@ def _moves(stage):
         sources, target = ops, target_dir
     moves = []
     for s in sources:
+        if set(s) & set("$`"):
+            continue
         if set(s) & set("*?["):
+            src, dst = resolve(s, cwd, stage.home), resolve(target, cwd, stage.home)
+            if src and dst:
+                moves.append((src, dst, "*glob*"))
             continue
         base = posixpath.basename(s.rstrip("/"))
         inside = posixpath.join(target, base)
@@ -900,7 +1086,7 @@ _KNOWN_EFFECTS = frozenset({"tee", "sed", "mv", "git mv", "rm", "git rm",
 
 def effects(command, cwd="", output="", home=None):
     """Ordered effects of a (possibly mutating) command:
-    ``("write", path)``, ``("move", src, dst, alt)``,
+    ``("write", path, alt)``, ``("move", src, dst, alt)``,
     ``("remove", path, recursive)``, ``("read", path)`` for content a stage
     showed the agent, and ``("opaque",)`` for a stage whose writes can't be
     known (a script, a build, a substitution). None when the command can't
@@ -909,22 +1095,22 @@ def effects(command, cwd="", output="", home=None):
     if stages is None:
         return None
     out = []
-    pipelines = _pipelines(stages)
-    attribute = len(pipelines) == 1
-    for pipe in pipelines:
+    pipes, credited = _credited_pipelines(stages)
+    printed = bool((output or "").strip())
+    sole = _sole_producer(pipes)
+    for k, pipe in enumerate(pipes):
         reads = set()
-        for k, stage in enumerate(pipe):
+        for j, stage in enumerate(pipe):
             name, args, _ = _program(stage)
             known = _stage_read_only(stage) or (name in _KNOWN_EFFECTS
                                                 and not stage.subst)
             if not known:
                 out.append(("opaque",))
-            out += [("write", p) for p in _writes(stage)]
+            out += [("write",) + w for w in _writes(stage)]
             out += [("move",) + m for m in _moves(stage)]
             out += [("remove",) + r for r in _removes(stage)]
             if _stage_read_only(stage):
-                reads |= _stage_reads(stage, output, attribute and k == 0)[0]
-        name, args, _ = _program(pipe[-1])
-        if _shows_content(name, args) and not pipe[-1].stdout_redirected:
+                reads |= _stage_reads(stage, output, pipe is sole)[0]
+        if k in credited and printed and _pipeline_shows(pipe):
             out += [("read", p) for p in sorted(reads)]
     return out

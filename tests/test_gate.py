@@ -615,8 +615,8 @@ def test_shell_is_read_only():
 
 
 def test_shell_read_operands():
-    assert shell_read_operands("cat app.cfg")[0] == {"app.cfg"}
-    assert shell_read_operands("grep -n app.cfg notes.txt")[0] == {"notes.txt"}
+    assert shell_read_operands("cat app.cfg", "x=1")[0] == {"app.cfg"}
+    assert shell_read_operands("grep -n app.cfg notes.txt", "3: app.cfg")[0] == {"notes.txt"}
     assert "app.cfg" in shell_read_operands("grep -rn x .", "./app.cfg:3:x=1")[0]
     assert shell_read_operands("ls -l app.cfg") == (set(), {"app.cfg"})
     assert shell_read_operands("echo app.cfg") == (set(), set())
@@ -626,11 +626,11 @@ def test_shell_read_operands():
 
 
 def test_shell_cd_and_subshells_resolve_operands():
-    assert shell_read_operands("cd conf && cat app.cfg")[0] == {"conf/app.cfg"}
-    assert shell_read_operands("(cd conf && ls) && cat app.cfg")[0] == {"app.cfg"}
-    assert shell_read_operands("(cd a && (cd b && cat x.cfg))")[0] == {"a/b/x.cfg"}
-    assert shell_read_operands("cd - && cat app.cfg")[0] == set()   # unknown dir
-    assert shell_read_operands("cat app.cfg", cwd="/srv/p")[0] == {"/srv/p/app.cfg"}
+    assert shell_read_operands("cd conf && cat app.cfg", "x")[0] == {"conf/app.cfg"}
+    assert shell_read_operands("(cd conf && ls) && cat app.cfg", "x")[0] == {"app.cfg"}
+    assert shell_read_operands("(cd a && (cd b && cat x.cfg))", "x")[0] == {"a/b/x.cfg"}
+    assert shell_read_operands("cd - && cat app.cfg", "x")[0] == set()   # unknown dir
+    assert shell_read_operands("cat app.cfg", "x", cwd="/srv/p")[0] == {"/srv/p/app.cfg"}
     assert shell_write_targets("cd conf && sed -i s/a/b/ app.cfg") == {"conf/app.cfg"}
     assert shell_is_read_only("(cd conf && cat app.cfg)")
     assert shell_is_read_only("grep -n x app.cfg || true")
@@ -644,13 +644,13 @@ def test_shell_git_revisions_and_diff_headers():
 def test_shell_content_must_reach_the_agent():
     assert shell_read_operands("cat app.cfg | wc -l") == (set(), {"app.cfg"})
     assert shell_read_operands("head app.cfg > /dev/null")[0] == set()
-    assert shell_read_operands("cat app.cfg 2>/dev/null")[0] == {"app.cfg"}
+    assert shell_read_operands("cat app.cfg 2>/dev/null", "x")[0] == {"app.cfg"}
     assert shell_read_operands("grep -q x app.cfg")[0] == set()
-    assert shell_read_operands("cat app.cfg | grep x")[0] == {"app.cfg"}
+    assert shell_read_operands("cat app.cfg | grep x", "x=1")[0] == {"app.cfg"}
 
 
 def test_json_tool_is_a_viewer_only_without_an_output_file():
-    assert shell_read_operands("python3 -m json.tool out.json")[0] == {"out.json"}
+    assert shell_read_operands("python3 -m json.tool out.json", "{}")[0] == {"out.json"}
     assert not shell_is_read_only("python -m json.tool in.json out.json")
     assert not shell_is_read_only("python -c 'print(1)'")
 
