@@ -7,7 +7,6 @@ variance is absorbed as integers, not prose.
 import fnmatch
 import posixpath
 import re
-import shlex
 from dataclasses import dataclass, field
 
 # Per-model-class presets. Two documented agent failure modes get their own
@@ -56,6 +55,8 @@ class GateState:
     # exited_unverified); moves and deletes transfer or clear entries, so an
     # entry can always be paid. See note_mutation / cover_pending.
     pending_verification: set = field(default_factory=set)
+    # owed entry -> the other path that also pays it (an ambiguous `mv a b`)
+    pending_aliases: dict = field(default_factory=dict)
     # per-turn latches
     grounded_this_turn: bool = False
     verified_this_turn: bool = False
@@ -94,30 +95,92 @@ class GateState:
                 "budget meaningless" % (refill, cap))
         return cls(budget=cap, cap=cap, refill=refill, **kw)
 
-    def note_mutation(self, args, cwd=""):
+    def note_mutation(self, args, cwd="", output="", failed=False):
         """Record a mutating call at ``current_step``.
 
         A completion now needs a fresh read AFTER this step, earlier
-        verification stops counting, the mutated identifiers join the claim
-        surface, and the call's targets are owed a re-read (see
-        ``mutation_targets``).
+        verification stops counting, and what the call changed is owed a
+        re-read. For a shell command (``{"command": ...}``) the effects are
+        applied in the order the command ran them (``shell.effects``): a
+        file it writes is owed, a move carries debt to the destination, an
+        ``rm`` clears it, and content the command itself showed afterwards
+        pays it. A temp file written and then moved or deleted in the same
+        command is therefore never left owed. ``failed`` calls may have
+        stopped anywhere, so only their reset applies: nothing is cleared,
+        moved or paid on their behalf.
         """
         self.last_mutation_step = self.current_step
         self.verified_this_turn = False
-        if isinstance(args, dict) and isinstance(args.get("command"), str):
-            # a deleted file (or a file under a deleted directory) can never
-            # be re-read: drop what it owed
-            self.pending_verification -= _removed(
-                shell_remove_targets(args["command"], cwd), self.pending_verification)
-        for src, dst in move_pairs(args, cwd):
-            # a moved file's debt moves with it: re-read it at its new path
-            moved = _removed({src}, self.pending_verification)
-            if moved:
-                self.pending_verification -= moved
-                self.pending_verification.add(dst)
-                self.claim_surface.add(dst)
-        self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
-        self.claim_surface |= mutation_identifiers(args)
+        command = args.get("command") if isinstance(args, dict) else None
+        if not isinstance(command, str):
+            self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
+            self.claim_surface |= mutation_identifiers(args)
+            src, dst = (args.get("source"), args.get("destination")) \
+                if isinstance(args, dict) else (None, None)
+            if isinstance(src, str) and isinstance(dst, str) and not failed:
+                self._move(_under(cwd, src), _under(cwd, dst), None)
+            return
+        if failed:
+            return
+        from . import shell
+        effs = shell.effects(command, cwd, output)
+        if effs is None:
+            return                     # unparseable: freshness still applies
+        for eff in effs:
+            kind = eff[0]
+            if kind == "write":
+                self.pending_verification.add(eff[1])
+                self.claim_surface.add(eff[1])
+            elif kind == "remove":
+                for e in _removed({eff[1]}, self.pending_verification):
+                    self._drop(e)
+            elif kind == "move":
+                self._move(*eff[1:])
+            elif kind == "read":
+                for e in self._owed_hits({eff[1]}):
+                    self._drop(e)
+        # content the command showed after its last change verifies it, as
+        # a separate re-read would (`npm test > log; tail log`)
+        last_change = max((k for k, e in enumerate(effs) if e[0] != "read"),
+                          default=-1)
+        trailing = {e[1] for e in effs[last_change + 1:] if e[0] == "read"}
+        if trailing and not self.pending_verification and surface_hits(
+                trailing, self.claim_surface):
+            self.verified_this_turn = True
+            self.last_verification_step = self.current_step
+
+    def _drop(self, entry):
+        self.pending_verification.discard(entry)
+        self.pending_aliases.pop(entry, None)
+
+    def _owed_hits(self, idents):
+        """Owed entries ``idents`` pay: the entry's path, or its alias."""
+        return {e for e in self.pending_verification
+                if surface_hits(idents, {e}) or (
+                    e in self.pending_aliases
+                    and surface_hits(idents, {self.pending_aliases[e]}))}
+
+    def _move(self, src, dst, alt):
+        """Carry debt from ``src`` (a file, or a directory holding owed
+        files) to ``dst``. ``alt`` is the other reading of an ambiguous
+        ``mv a b``: b may be an existing directory, so b/a also pays."""
+        for e in list(self.pending_verification):
+            ce = "/" + _canonical(e)
+            inside = "/" + _canonical(src).rstrip("/") + "/"
+            if surface_hits({src}, {e}):
+                new, alias = dst, alt
+            elif inside in ce:
+                rest = ce[ce.index(inside) + len(inside):]
+                new = posixpath.join(dst, rest)
+                alias = posixpath.join(alt, rest) if alt else None
+            else:
+                continue
+            self._drop(e)
+            self.pending_verification.add(new)
+            self.claim_surface.add(new)
+            if alias:
+                self.pending_aliases[new] = alias
+                self.claim_surface.add(alias)
 
     def observation_identifiers(self, tool_name, args, result):
         """Identifiers one tool call touched (per-tool extractor or default).
@@ -128,11 +191,15 @@ class GateState:
         ids = self.extractors.get(tool_name, extract_identifiers)(args, result)
         return {ids} if isinstance(ids, str) else set(ids)
 
-    def cover_pending(self, tool_name, args, result):
+    def cover_pending(self, tool_name, args, result, idents=None):
         """Mark the owed targets this verified-tier read covers; return True
-        once nothing is owed (the completion is fully verified)."""
-        idents = self.observation_identifiers(tool_name, args, result)
-        self.pending_verification -= surface_hits(idents, self.pending_verification)
+        once nothing is owed (the completion is fully verified). ``idents``
+        overrides what the read covers (a shell read covers only the files
+        whose content it showed, not ones it merely listed)."""
+        if idents is None:
+            idents = self.observation_identifiers(tool_name, args, result)
+        for e in self._owed_hits(idents):
+            self._drop(e)
         return not self.pending_verification
 
     def progress(self):
@@ -275,6 +342,13 @@ def _canonical(ident):
     return ident
 
 
+class Symbol(str):
+    """An identifier read from file TEXT (``parse_config``), not a path the
+    call touched. It matches only a claim-surface entry that is itself a
+    bare name, so a README that mentions the ``Makefile`` can't pay the debt
+    owed by ``/app/Makefile``."""
+
+
 def surface_hits(idents, surface):
     """The claim-surface entries that ``idents`` refer to.
 
@@ -282,13 +356,15 @@ def surface_hits(idents, surface):
     dropping a leading ``./``), so ``app.cfg``, ``./app.cfg``,
     ``proj/app.cfg`` and ``/srv/proj/app.cfg`` all name the same file, while
     ``/etc/app.cfg`` and ``/srv/proj/app.cfg`` stay distinct (neither is a
-    tail of the other). Non-path identifiers still need an exact match.
+    tail of the other). Non-path identifiers still need an exact match, and
+    a ``Symbol`` matches only a bare-name entry.
     """
-    idents = {_canonical(i) for i in idents}
+    symbols = {str(i) for i in idents if isinstance(i, Symbol)}
+    idents = {_canonical(i) for i in idents if not isinstance(i, Symbol)}
     hits = set()
     for entry in surface:
         s = _canonical(entry)
-        if s in idents:
+        if s in idents or ("/" not in entry and entry in symbols):
             hits.add(entry)
             continue
         # an identifier that is a tail of the surface path ("app.cfg" for
@@ -306,22 +382,30 @@ def surface_hits(idents, surface):
 _PATH_KEYS = ("file_path", "path", "notebook_path", "filename", "file")
 
 
+def path_values(tool_input):
+    """Whole path strings from a structured call's path keys. A path is one
+    identifier: splitting ``a.cfg~`` or ``my notes.txt`` into word tokens
+    would make different files alias each other."""
+    if not isinstance(tool_input, dict):
+        return set()
+    return {str(v) for k, v in tool_input.items()
+            if k in _PATH_KEYS and isinstance(v, (str, int, float)) and str(v)}
+
+
 def mutation_identifiers(tool_input):
     """Identifiers of WHAT a mutation touched — extracted from VALUES only.
 
     JSON schema keys (``file_path``, ``content``) are shared across every
     file tool; letting them into the claim surface would make a read of ANY
-    file pass the relevance gate. Path-like values are preferred when
-    present; otherwise all values contribute.
+    file pass the relevance gate. Path-key values are used whole when
+    present; otherwise all values contribute. (Shell commands are handled by
+    ``note_mutation``, which adds only the files a command writes, never
+    words from its description.)
     """
     if isinstance(tool_input, dict):
-        path_vals = [v for k, v in tool_input.items()
-                     if k in _PATH_KEYS and isinstance(v, (str, int, float))]
-        if path_vals:
-            out = set()
-            for v in path_vals:
-                out |= extract_identifiers(str(v), "")
-            return out
+        paths = path_values(tool_input)
+        if paths:
+            return paths
         out = set()
         for v in tool_input.values():
             out |= mutation_identifiers(v)
@@ -337,21 +421,16 @@ def mutation_identifiers(tool_input):
 
 
 def mutation_targets(args, surface, cwd=""):
-    """What a mutating call verifiably changed, for per-target coverage.
+    """What a structured or free-text mutating call verifiably changed.
 
     Path-key values of a structured call (``{"file_path": ...}``), or, for
-    free-text args, the claim-surface entries they name. Anything vaguer (a
-    shell command with no path key) returns nothing and the completion falls
-    back to the freshness check alone, because an unparseable target could
-    never be covered and would trap the agent.
+    free-text args, the claim-surface entries they name. Shell commands are
+    handled by ``note_mutation`` via ``shell.effects``; anything vaguer
+    returns nothing and the completion falls back to the freshness check,
+    because a target no read could match would trap the agent.
     """
     if isinstance(args, dict):
-        targets = {i for k, v in args.items()
-                   if k in _PATH_KEYS and isinstance(v, (str, int, float))
-                   for i in extract_identifiers(str(v), "")}
-        if not targets and isinstance(args.get("command"), str):
-            targets = shell_write_targets(args["command"], cwd)
-        return targets
+        return path_values(args)
     if isinstance(args, str):
         return surface_hits(extract_identifiers(args, ""), surface)
     if isinstance(args, (list, tuple)):
@@ -359,328 +438,23 @@ def mutation_targets(args, surface, cwd=""):
     return set()
 
 
-_SHELL_SEP = re.compile(r"\|\||&&|[;|&\n]")
-_SHELL_SEP_KEEP = re.compile(r"(\|\||&&|[;|&\n])")
-# plain redirects only: `2>err.log` and `>&2` are diagnostics, not the edit
-_REDIRECT = re.compile(r"(?<![\d&>])>>?[ \t]*([^\s;|&<>]+)")
-
-
-def _segments(command, cwd=""):
-    """``(segment, argv, resolve, piped)`` per simple command in ``command``;
-    ``piped`` is True when its output feeds the next command through ``|``.
-
-    ``argv`` is None when the segment doesn't parse. ``resolve(path)`` maps a
-    relative path through ``cwd`` (the session's working directory, when
-    known) and any earlier ``cd`` in the same command
-    (``cd conf && cat app.cfg`` reads ``conf/app.cfg``); it returns None
-    once a ``cd`` goes somewhere unknown (``cd``, ``cd -``, ``cd ~``,
-    ``cd $DIR``), so callers skip what they can't place.
-    """
-    cwd, saved = posixpath.normpath(cwd) if cwd else "", []
-    pieces = _SHELL_SEP_KEEP.split(command)
-    for k in range(0, len(pieces), 2):
-        segment = pieces[k]
-        piped = k + 1 < len(pieces) and pieces[k + 1] == "|"
-        # `(cd conf && cat x)`: a subshell's cd ends with its closing paren
-        body = _HARMLESS_REDIRECTS.sub("", segment).strip()
-        opens = len(body) - len(body.lstrip("("))
-        closes = len(body) - len(body.rstrip(")"))
-        saved += [cwd] * opens
-        try:
-            argv = shlex.split(body.strip("()"))
-        except ValueError:
-            argv = None
-
-        def resolve(path, cwd=cwd):
-            if path.startswith("/") or cwd == "":
-                return path
-            return None if cwd is None else posixpath.join(cwd, path)
-
-        yield segment, argv, resolve, piped
-        if argv and argv[0] == "cd":
-            target = argv[1] if len(argv) > 1 else "~"
-            if target == "-" or set(target) & set("~$`"):
-                cwd = None
-            elif target.startswith("/"):
-                cwd = posixpath.normpath(target)
-            elif cwd is not None:
-                cwd = posixpath.normpath(posixpath.join(cwd, target))
-        for _ in range(min(closes, len(saved))):
-            cwd = saved.pop()
-
-
-def shell_write_targets(command, cwd=""):
-    """Files a shell command explicitly writes, from a few unambiguous forms:
-    ``> FILE``, ``>> FILE``, ``tee [-a] FILE...`` and ``sed -i ... FILE...``.
-
-    Anything else (``pytest x.py``, ``python3.11 s.py``, ``cat app.cfg``)
-    yields nothing, so read-only shell use never leaves a re-read owed. Paths
-    built from variables or globs are skipped too: a target that can never be
-    matched by a later read would trap the agent.
-    """
-    out = set()
-    for segment, argv, resolve, _ in _segments(command, cwd):
-        files = _REDIRECT.findall(segment)
-        argv = argv or []
-        if argv and argv[0] == "tee":
-            files += [a for a in argv[1:] if not a.startswith("-")]
-        elif argv and argv[0] == "sed" and any(
-                a.startswith("-i") or a == "--in-place" for a in argv[1:]):
-            rest, has_e, skip = [], False, False
-            for a in argv[1:]:
-                if skip:
-                    skip = False
-                elif a in ("-e", "-f", "--expression", "--file"):
-                    has_e, skip = True, True
-                elif not a.startswith("-"):
-                    rest.append(a)
-            files += rest if has_e else rest[1:]   # first operand is the script
-        out |= {r for r in (resolve(f) for f in files
-                            if f != "/dev/null" and not set(f) & set("$*?`{")) if r}
-    return _identifiers_of(out)
-
-
-# programs that only read (no flag of theirs used here writes a file); `sed`,
-# `awk`, `sort` and `find` are left out because a script or flag can write
-_READ_ONLY_PROGRAMS = frozenset({
-    "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "diff",
-    "cmp", "stat", "file", "nl", "cut", "tr", "jq", "tree", "du", "df", "pwd",
-    "cd", "echo", "printf", "which", "md5sum", "sha256sum", "true", ":"})
-_READ_ONLY_GIT = frozenset({"diff", "show", "log", "status", "blame", "ls-files"})
-_HARMLESS_REDIRECTS = re.compile(r"\d?>\s*/dev/null|\d?>&\d")
-
-
-def _removed(operands, pending):
-    """The owed entries an ``rm`` of ``operands`` deleted: path matches as in
-    ``surface_hits``, entries under a removed directory, and glob operands
-    matched against each entry's trailing components (``tmp*.txt`` removes
-    ``/srv/proj/tmp1.txt``)."""
-    hits = surface_hits(_identifiers_of(operands), pending)
-    for operand in operands:
-        # `rm -r build` removes everything owed under build/
-        inside = "/" + _canonical(operand).rstrip("/") + "/"
-        hits |= {e for e in pending if inside in "/" + _canonical(e)}
-    for pattern in (o[2:] if o.startswith("./") else o for o in operands):
-        if set(pattern) & set("*?["):
-            depth = pattern.count("/") + 1
-            hits |= {e for e in pending
-                     if fnmatch.fnmatchcase("/".join(e.split("/")[-depth:]), pattern)}
-    return hits
-
-
 def _under(cwd, path):
     return path if path.startswith("/") or not cwd else posixpath.join(cwd, path)
 
 
-def move_pairs(args, cwd=""):
-    """``(source, destination)`` for each file a call moves: ``mv`` and
-    ``git mv`` in a shell command, or a structured ``source``/``destination``
-    call (the MCP filesystem server's ``move_file``). With several sources,
-    or a destination ending in ``/``, the destination is a directory."""
-    if not isinstance(args, dict):
-        return []
-    src, dst = args.get("source"), args.get("destination")
-    if isinstance(src, str) and isinstance(dst, str):
-        return [(_under(cwd, src), _under(cwd, dst))]
-    command = args.get("command")
-    if not isinstance(command, str):
-        return []
-    pairs = []
-    for _, argv, resolve, _ in _segments(command, cwd):
-        if not argv:
+def _removed(operands, pending):
+    """The owed entries an ``rm`` of ``operands`` deleted: the files
+    themselves (path matching as in ``surface_hits``), entries under a
+    removed directory, and glob matches on each entry's trailing components
+    (``tmp*.txt`` removes ``/srv/proj/tmp1.txt``)."""
+    hits = set()
+    for operand in operands:
+        if set(operand) & set("*?["):
+            depth = operand.count("/") + 1
+            hits |= {e for e in pending if fnmatch.fnmatchcase(
+                "/".join(_canonical(e).split("/")[-depth:]), _canonical(operand))}
             continue
-        if argv[0] == "mv":
-            operands = argv[1:]
-        elif argv[:2] == ["git", "mv"]:
-            operands = argv[2:]
-        else:
-            continue
-        operands = [o for o in operands
-                    if not o.startswith("-") and not set(o) & set("$`{*?")]
-        if len(operands) < 2:
-            continue
-        *sources, target = operands
-        into_dir = len(sources) > 1 or target.endswith("/")
-        for s in sources:
-            d = posixpath.join(target, posixpath.basename(s)) if into_dir else target
-            if resolve(s) and resolve(d):
-                pairs.append((resolve(s), resolve(d)))
-    return pairs
-
-
-def shell_remove_targets(command, cwd=""):
-    """Path operands of any ``rm`` in a shell command, globs included
-    (``tmp*.txt``); operands built from variables are skipped."""
-    out = set()
-    for _, argv, resolve, _ in _segments(command, cwd):
-        if argv and argv[0] == "rm":
-            out |= {r for r in (resolve(a) for a in argv[1:]
-                                if not a.startswith("-") and not set(a) & set("$`{"))
-                    if r}
-    return out
-
-
-# How a read-only program relates to the files it is given: CONTENT programs
-# print what the files say (can verify a change), LISTING programs report
-# that they exist or their size (an assertion at most), and anything else in
-# _READ_ONLY_PROGRAMS (echo, pwd, ...) observes no file at all.
-_CONTENT_PROGRAMS = frozenset({"cat", "head", "tail", "nl", "diff", "cmp",
-                               "cut", "md5sum", "sha256sum"})
-# ...of which these print the lines themselves, not a digest or a verdict
-_PASS_THROUGH_PROGRAMS = frozenset({"cat", "head", "tail", "nl", "diff", "cut", "tr",
-                                    "json.tool"})
-_PATTERN_PROGRAMS = frozenset({"grep", "egrep", "fgrep", "rg", "jq"})
-# sed/awk run as pure viewers (see _is_viewer): script first, then files
-_VIEWER_PROGRAMS = frozenset({"sed", "awk"})
-# sed scripts that only print: "p", "5,9p", "$p", "/re/p", "="
-_SED_ADDR = r"(?:\d+|\$|/[^/]*/)"
-_SED_PRINT_ONLY = re.compile(
-    r"^\s*(?:%s(?:\s*,\s*%s)?)?\s*[p=]?\s*$" % (_SED_ADDR, _SED_ADDR))
-_AWK_SIDE_EFFECTS = ("system", "getline", "|", ">", "close", "fflush")
-
-
-_PYTHON = re.compile(r"^python(?:3(?:\.\d+)?)?$")
-
-
-def _is_json_tool(argv):
-    """``python -m json.tool [FILE]``: pretty-prints only. A second operand
-    would be an output file, so that form doesn't qualify."""
-    return (len(argv) >= 3 and bool(_PYTHON.match(argv[0]))
-            and argv[1:3] == ["-m", "json.tool"]
-            and len([a for a in argv[3:] if not a.startswith("-")]) <= 1)
-
-
-def _is_viewer(argv):
-    """``sed`` with no in-place flag and print-only scripts, or ``awk`` whose
-    program can't run commands or write files: both only print file content."""
-    args = argv[1:]
-    if argv[0] == "sed":
-        if any(a.startswith("-i") or a.startswith("--in-place") or a in ("-f", "--file")
-               for a in args):
-            return False
-        scripts = [args[k + 1] for k, a in enumerate(args[:-1])
-                   if a in ("-e", "--expression")]
-        if not scripts:
-            operands = [a for a in args if not a.startswith("-")]
-            scripts = operands[:1]
-        return bool(scripts) and all(_SED_PRINT_ONLY.match(x) for x in scripts)
-    if argv[0] == "awk":
-        if "-f" in args:
-            return False
-        operands = [a for a in args if not a.startswith("-")]
-        return bool(operands) and not any(t in operands[0] for t in _AWK_SIDE_EFFECTS)
-    return False
-_LISTING_PROGRAMS = frozenset({"ls", "stat", "file", "wc", "du", "tree"})
-_GIT_CONTENT = frozenset({"diff", "show", "blame"})
-_GIT_LISTING = frozenset({"status", "log", "ls-files"})
-_DIFF_NEW_FILE = re.compile(r"^\+\+\+ b/(\S+)", re.M)
-_OUTPUT_PATH = re.compile(r"^([^\s:]+):", re.M)
-
-
-def shell_read_operands(command, output="", cwd=""):
-    """``(content, listed)``: identifiers of the files a read-only shell
-    command shows the content of, and of those it only lists.
-
-    Operands only: a grep/rg/jq pattern or an ``echo`` argument names nothing
-    that was read. Pattern programs also credit the ``path:`` prefixes of
-    their output lines, which is how a recursive search reports whose content
-    matched.
-    """
-    content, listed = set(), set()
-    stage_content, stage_listed = set(), set()   # of the current pipeline
-    for segment, argv, resolve, piped in _segments(command, cwd):
-        if not argv:
-            continue
-        seen_content, seen_listed = set(), set()
-        prog, args = argv[0], argv[1:]
-        if prog == "git" and args:
-            prog, args = "git " + args[0], args[1:]
-        elif _is_json_tool(argv):
-            prog, args = "json.tool", argv[3:]
-        operands = [a for a in args if not a.startswith("-")]
-        if prog in _VIEWER_PROGRAMS:
-            # the script comes first unless given with -e / -f
-            seen_content.update(operands if any(a in ("-e", "-f") for a in args)
-                                else operands[1:])
-        elif prog in _PATTERN_PROGRAMS:
-            if not any(a in ("-e", "-f") or a.startswith("--regexp") for a in args):
-                operands = operands[1:]   # the first operand is the pattern
-            seen_content.update(_OUTPUT_PATH.findall(str(output)))
-            seen_content.update(operands)
-        elif prog.startswith("git ") and prog[4:] in _GIT_CONTENT:
-            # REV:path is a committed copy, not the working tree; a diff
-            # names the working-tree files it shows in its +++ headers
-            seen_content.update(o for o in operands if ":" not in o)
-            if prog == "git diff":
-                seen_content.update(_DIFF_NEW_FILE.findall(str(output)))
-        elif prog in _CONTENT_PROGRAMS or prog == "json.tool":
-            seen_content.update(operands)
-        elif prog in _LISTING_PROGRAMS or (
-                prog.startswith("git ") and prog[4:] in _GIT_LISTING):
-            seen_listed.update(operands)
-        stage_content |= {r for r in map(resolve, seen_content) if r}
-        stage_listed |= {r for r in map(resolve, seen_listed) if r}
-        if piped:
-            continue
-        # the pipeline's LAST stage decides what the agent actually saw:
-        # content only if it passes lines through to the agent
-        if _shows_content(prog, args) and not _STDOUT_DISCARDED.search(segment):
-            content |= stage_content
-        else:
-            listed |= stage_content
-        listed |= stage_listed
-        stage_content, stage_listed = set(), set()
-    return _identifiers_of(content), _identifiers_of(listed)
-
-
-# stdout (not just stderr) thrown away: `> /dev/null`, `&> /dev/null`
-_STDOUT_DISCARDED = re.compile(r"(?:^|[^\d>&])&?>\s*/dev/null")
-_QUIET_FLAGS = frozenset("qclL")   # grep/rg: quiet, count, files-only
-
-
-def _shows_content(prog, args):
-    """Whether a pipeline's last program passes file lines to the agent
-    (``cat``, ``head``, ``grep``, ...) rather than a count, a checksum,
-    or nothing (``wc``, ``md5sum``, ``grep -q``)."""
-    if prog in _PATTERN_PROGRAMS:
-        return not any(
-            a in ("--quiet", "--silent", "--count", "--files-with-matches",
-                  "--files-without-match")
-            or (a.startswith("-") and not a.startswith("--")
-                and set(a[1:]) & _QUIET_FLAGS)
-            for a in args)
-    return (prog in _PASS_THROUGH_PROGRAMS or prog in _VIEWER_PROGRAMS
-            or (prog.startswith("git ") and prog[4:] in _GIT_CONTENT))
-
-
-def _identifiers_of(paths):
-    return {i for p in paths for i in extract_identifiers(p, "")}
-
-
-def shell_is_read_only(command):
-    """True when every piece of a shell command is a known read-only program
-    with no output redirect, ``tee``, or command substitution. Anything this
-    can't vouch for is treated as a possible write, as before."""
-    if any(t in command for t in ("`", "$(", "<(", ">(")):
-        return False
-    command = _HARMLESS_REDIRECTS.sub("", command)   # before `&` splits 2>&1
-    if ">" in command:
-        return False
-    saw_program = False
-    for _, argv, _, _ in _segments(command):
-        if argv is None:
-            return False
-        if not argv:
-            continue
-        saw_program = True
-        if argv[0] == "git":
-            if len(argv) < 2 or argv[1] not in _READ_ONLY_GIT:
-                return False
-        elif argv[0] in _VIEWER_PROGRAMS:
-            if not _is_viewer(argv):
-                return False
-        elif _is_json_tool(argv):
-            pass
-        elif argv[0] not in _READ_ONLY_PROGRAMS:
-            return False
-    return saw_program
+        hits |= surface_hits({operand}, pending)
+        inside = "/" + _canonical(operand).rstrip("/") + "/"
+        hits |= {e for e in pending if inside in "/" + _canonical(e)}
+    return hits

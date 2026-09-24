@@ -61,8 +61,9 @@ import re
 
 from ..boundary import ACCEPT, boundary_check
 from ..classifier import classify_observation
-from ..state import (_PATH_KEYS, GateState, extract_identifiers, shell_is_read_only,
-                     shell_read_operands, surface_hits)
+from .. import shell
+from ..state import (_PATH_KEYS, GateState, Symbol, extract_identifiers,
+                     path_values, surface_hits)
 
 # Built-in SDK tools by consequence class. Unknown tools (MCP tools other than
 # the reference filesystem server's, see _MCP_FILESYSTEM) are treated as
@@ -70,6 +71,10 @@ from ..state import (_PATH_KEYS, GateState, extract_identifiers, shell_is_read_o
 # conservative in both directions. Override per-agent.
 DEFAULT_READ_ONLY_TOOLS = frozenset(
     {"Read", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookRead"})
+# Read-only tools that fetch REMOTE text. A page or search result that names
+# a local file is not a read of that file: they never verify a change, and
+# only the symbols in their text (never paths) count toward relevance.
+DEFAULT_REMOTE_TOOLS = frozenset({"WebFetch", "WebSearch"})
 # Read-only tools that report what EXISTS (names, paths), not what a file now
 # says. They can ground an assertion but never verify a change.
 DEFAULT_LISTING_TOOLS = frozenset({"Glob"})
@@ -79,7 +84,7 @@ DEFAULT_LISTING_TOOLS = frozenset({"Glob"})
 DEFAULT_CONTENT_TOOLS = frozenset({"Read", "NotebookRead"})
 # Bash is classed as mutating because it CAN mutate. A command built only
 # from known read-only programs (cat, grep, git diff, ...; see
-# state.shell_is_read_only) is the exception: it is treated as a read.
+# shell.is_read_only) is the exception: it is treated as a read.
 DEFAULT_MUTATING_TOOLS = frozenset(
     {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
 
@@ -161,20 +166,63 @@ def _grep_lists_files(tool, tool_input, response, result):
 def _symbols(text):
     """Non-path identifiers in file content (``parse_config`` in the source
     that defines it), with dotted names also split into their parts so
-    ``settings.load_settings`` names ``load_settings``. File NAMES the text
-    mentions are left out: those files were not read."""
+    ``settings.load_settings`` names ``load_settings``. They come back as
+    ``Symbol``s, which match only bare-name surface entries: file NAMES the
+    text mentions (``Makefile``, ``app.cfg``) were not read."""
     out = set()
     for i in extract_identifiers("", text):
         if not _PATH_LIKE.search(i):
-            out.add(i)
-            out.update(p for p in i.split(".") if p)
+            out.add(Symbol(i))
+            out.update(Symbol(p) for p in i.split(".") if p)
     return out
 
 
+def _decode(text):
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _output_text(response):
+    """What a tool printed. Claude Code's Bash response is a dict with
+    ``stdout``/``stderr``; line-based parsing needs the real newlines, not
+    the escaped ones in its JSON serialization."""
+    if isinstance(response, str):
+        decoded = _decode(response)
+        response = decoded if isinstance(decoded, dict) else response
+    if isinstance(response, dict) and ("stdout" in response or "stderr" in response):
+        return "\n".join(str(response.get(k) or "") for k in ("stdout", "stderr"))
+    if isinstance(response, dict) and "content" in response:
+        return str(response.get("content") or "")
+    return response if isinstance(response, str) else _serialize(response)
+
+
 def _content_identifiers(args, result):
-    """Relevance for content tools: the path that was read, plus the
+    """Relevance for content tools: the path that was read (whole), plus the
     symbols in its text."""
-    return extract_identifiers(args, "") | _symbols(result)
+    decoded = _decode(args)
+    paths = path_values(decoded) if isinstance(decoded, dict) else set()
+    return (paths or extract_identifiers(args, "")) | _symbols(_output_text(result))
+
+
+def _remote_identifiers(args, result):
+    """Relevance for web tools: symbols in the fetched text only."""
+    return _symbols(_output_text(result))
+
+
+def _grep_identifiers(args, result):
+    """Relevance for the Grep tool: files whose lines it printed (the
+    ``path:`` prefixes of content output, or the searched path when it is
+    one file and lines carry no prefix), plus symbols in the matched text.
+    A file named inside a pattern or a matched line was not searched."""
+    decoded = _decode(args)
+    searched = decoded.get("path") if isinstance(decoded, dict) else None
+    text = _output_text(result)
+    prefixed = set(shell._OUTPUT_PATH.findall(text))
+    paths = prefixed or ({searched} if isinstance(searched, str) and text.strip()
+                         else set())
+    return paths | _symbols(text)
 
 
 def _absolutize(tool_input, cwd):
@@ -190,19 +238,18 @@ def _absolutize(tool_input, cwd):
 
 def _shell_identifiers(args, result, cwd=""):
     """Relevance for a read-only shell call: the files it operates on (and
-    the ``path:`` prefixes a search prints), never a grep pattern or an echo
-    argument. Only consulted for shell reads: a mutating call grounds
-    nothing whatever it touches."""
-    try:
-        command = json.loads(args).get("command")
-    except (ValueError, AttributeError):
-        command = None
+    the ``path:`` prefixes a multi-file search prints), never a grep pattern
+    or an echo argument. Only consulted for shell reads: a mutating call
+    grounds nothing whatever it touches."""
+    decoded = _decode(args)
+    command = decoded.get("command") if isinstance(decoded, dict) else None
     if not isinstance(command, str):
         return extract_identifiers(args, result)
-    content, listed = shell_read_operands(command, result, cwd)
+    text = _output_text(result)
+    content, listed = shell.read_operands(command, text, cwd)
     # output is file content only when a content program ran (not for a
     # bare `echo load_settings`)
-    return content | listed | (_symbols(result) if content else set())
+    return content | listed | (_symbols(text) if content else set())
 
 
 class GateHooks:
@@ -271,12 +318,16 @@ class GateHooks:
                  mutating_tools=DEFAULT_MUTATING_TOOLS,
                  listing_tools=DEFAULT_LISTING_TOOLS,
                  content_tools=DEFAULT_CONTENT_TOOLS,
+                 remote_tools=DEFAULT_REMOTE_TOOLS,
                  max_blocks=3, gate_subagents=False,
                  normalizers=None, extractors=None,
                  verifier=None, emit_progress=False):
         extractors = dict(extractors or {})
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
+        for tool in remote_tools:
+            extractors.setdefault(tool, _remote_identifiers)
+        extractors.setdefault("Grep", _grep_identifiers)
         for tool in mutating_tools:
             extractors.setdefault(tool, self._shell_extract)
         self.state = GateState.for_model_class(
@@ -285,6 +336,7 @@ class GateHooks:
         self.read_only_tools = set(read_only_tools)
         self.mutating_tools = set(mutating_tools)
         self.listing_tools = set(listing_tools)
+        self.remote_tools = set(remote_tools)
         self.max_blocks = max_blocks
         self.gate_subagents = gate_subagents
         # optional verify_with tier: a verifier can DOWNGRADE a grounded finish
@@ -297,6 +349,7 @@ class GateHooks:
         self._blocks = 0
         self._tool_calls_this_turn = 0
         self._cwd = ""   # session working directory, from hook inputs
+        self._mutated_this_turn = False
 
     # ------------------------------------------------------------ hooks
 
@@ -306,9 +359,10 @@ class GateHooks:
             return {}
         if input_data.get("agent_id") and not self.gate_subagents:
             return {}
-        tool = input_data.get("tool_name", "")
+        tool = input_data.get("tool_name") or ""
         self._note_cwd(input_data)
         tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
+        output = _output_text(input_data.get("tool_response", ""))
         # (mutation-epoch novelty — a fresh mutation re-opening the verifying
         # re-read — lives in classify_observation's hash tuple, not in the
         # text, so custom normalizers can't corrupt it)
@@ -325,18 +379,23 @@ class GateHooks:
                      or mcp in ("content", "listing"))
 
         obs = classify_observation(tool, args, result, self.state, read_only)
-        if shell_read and not surface_hits(
-                shell_read_operands(tool_input["command"], result, self._cwd)[0],
-                self.state.claim_surface):
-            obs["grounds_completion"] = False   # listed, not shown
-        if (tool in self.listing_tools or mcp == "listing"
+        shown = None
+        if shell_read:
+            # only files whose content reached the agent can verify; files
+            # it merely listed or counted cannot
+            shown = shell.read_operands(tool_input["command"], output, self._cwd)[0]
+            if not surface_hits(shown, self.state.claim_surface):
+                obs["grounds_completion"] = False
+        if (tool in self.listing_tools or tool in self.remote_tools
+                or mcp == "listing"
                 or _grep_lists_files(tool, tool_input,
                                      input_data.get("tool_response"), result)):
             # a listing shows the file exists, not what the change wrote
             obs["grounds_completion"] = False
         qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
         self.state.grounded_this_turn |= obs["grounds_assertion"]
-        if obs["grounds_completion"] and self.state.cover_pending(tool, args, result):
+        if obs["grounds_completion"] and self.state.cover_pending(
+                tool, args, result, idents=shown):
             self.state.verified_this_turn = True
         if qualifying:
             self.state.budget = min(
@@ -351,7 +410,7 @@ class GateHooks:
             if obs["grounds_completion"]:
                 self.state.last_verification_step = self.state.current_step
         if (tool in self.mutating_tools and not shell_read) or mcp == "mutating":
-            self._record_mutation(tool_input)
+            self._record_mutation(tool_input, output)
         return {}
 
     async def post_tool_use_failure(self, input_data, tool_use_id, context):
@@ -364,11 +423,11 @@ class GateHooks:
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
         self._note_cwd(input_data)
-        tool = input_data.get("tool_name", "")
+        tool = input_data.get("tool_name") or ""
         tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
         if ((tool in self.mutating_tools and not self._is_shell_read(tool, tool_input))
                 or _mcp_class(tool) == "mutating"):
-            self._record_mutation(tool_input)
+            self._record_mutation(tool_input, failed=True)
         return {}
 
     async def stop(self, input_data, tool_use_id, context):
@@ -378,8 +437,9 @@ class GateHooks:
         if self._tool_calls_this_turn == 0:
             return {}   # tool-free turn: conversational, gate exempt
 
-        claim_type = ("completion" if self.state.last_mutation_step > 0
-                      else "assertion")
+        # a turn that changed nothing makes assertions, whatever earlier
+        # turns did
+        claim_type = "completion" if self._mutated_this_turn else "assertion"
         # forward the optional verifier: a downgrade returns REJECT and flows
         # through the UNCHANGED block/budget/escape path below, so the agent
         # still reaches the UNVERIFIED valve — the tier adds strictness, never a trap
@@ -415,6 +475,8 @@ class GateHooks:
         # already reported (exited_unverified); carrying them over would
         # block every later turn over work the user has moved past
         self.state.pending_verification = set()
+        self.state.pending_aliases = {}
+        self._mutated_this_turn = False
         self.state.turn_observations = []    # per-turn; load-bearing (else a long
         #                                      session leaks retained observations).
         # last_verification_step is intentionally NOT reset — it is a monotonic
@@ -471,7 +533,7 @@ class GateHooks:
         records no mutation."""
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         return (tool in self.mutating_tools and isinstance(command, str)
-                and shell_is_read_only(command))
+                and shell.is_read_only(command))
 
     def _note_cwd(self, input_data):
         """Track the session's working directory (every SDK hook input
@@ -483,11 +545,12 @@ class GateHooks:
     def _shell_extract(self, args, result):
         return _shell_identifiers(args, result, self._cwd)
 
-    def _record_mutation(self, tool_input):
+    def _record_mutation(self, tool_input, output="", failed=False):
         # a NEW mutation invalidates any earlier verification, its targets are
         # owed a re-read, and mutated identifiers join the claim surface so
         # only reads of THOSE count as verification
-        self.state.note_mutation(tool_input, self._cwd)
+        self._mutated_this_turn = True
+        self.state.note_mutation(tool_input, self._cwd, output, failed)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier

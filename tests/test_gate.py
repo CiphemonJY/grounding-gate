@@ -516,9 +516,15 @@ def test_progress_after_mutate_verify_complete():
 
 # ------------------------------------------- paths, coverage, shell parsing
 
-from grounding_gate.state import (  # noqa: E402
-    mutation_targets, shell_is_read_only, shell_read_operands, shell_write_targets,
-    surface_hits)
+from grounding_gate import shell  # noqa: E402
+from grounding_gate.state import mutation_targets, surface_hits  # noqa: E402
+
+shell_is_read_only = shell.is_read_only
+shell_read_operands = shell.read_operands
+
+
+def shell_write_targets(command):
+    return {e[1] for e in shell.effects(command) or [] if e[0] == "write"}
 
 
 def test_surface_hits_resolve_dotdot():
@@ -581,8 +587,9 @@ def test_turn_loop_verifies_undeclared_mutation_targets():
 def test_mutation_targets_forms():
     assert mutation_targets({"file_path": "/a/b.cfg", "content": "x"}, set()) == {"/a/b.cfg"}
     assert mutation_targets("edit ./b.cfg now", {"b.cfg", "c.cfg"}) == {"b.cfg"}
-    assert mutation_targets({"command": "sed -i s/a/b/ x.cfg"}, set()) == {"x.cfg"}
-    assert mutation_targets({"command": "python fix.py"}, set()) == set()
+    # shell commands go through note_mutation's ordered effects instead
+    assert shell_write_targets("sed -i s/a/b/ x.cfg") == {"x.cfg"}
+    assert shell_write_targets("python fix.py") == set()
 
 
 def test_shell_write_targets():
@@ -598,11 +605,11 @@ def test_shell_write_targets():
 def test_shell_is_read_only():
     for cmd in ("cat app.cfg", "grep -rn x . | wc -l", "git diff HEAD",
                 "ls 2>/dev/null", "cat a 2>&1 | grep x", "sed -n 1p a",
-                "sed -n '5,9p' a", "awk 'NR<=20' a"):
+                "sed -n '5,9p' a", "awk 'NR<=20' a", "FOO=1 cat a"):
         assert shell_is_read_only(cmd), cmd
     for cmd in ("cat a > b", "cat a | tee b", "echo $(rm x)", "git push",
                 "sed s/a/b/ a", "sed -n 1w out a", "sed -i -n 1p a",
-                "awk '{system(\"rm x\")}' a", "FOO=1 cat a", "cat a & rm b",
+                "awk '{system(\"rm x\")}' a", "cat a & rm b",
                 "rm -rf x", ""):
         assert not shell_is_read_only(cmd), cmd
 
@@ -610,10 +617,12 @@ def test_shell_is_read_only():
 def test_shell_read_operands():
     assert shell_read_operands("cat app.cfg")[0] == {"app.cfg"}
     assert shell_read_operands("grep -n app.cfg notes.txt")[0] == {"notes.txt"}
-    assert "./app.cfg" in shell_read_operands("grep -rn x .", "./app.cfg:3:x=1")[0]
+    assert "app.cfg" in shell_read_operands("grep -rn x .", "./app.cfg:3:x=1")[0]
     assert shell_read_operands("ls -l app.cfg") == (set(), {"app.cfg"})
     assert shell_read_operands("echo app.cfg") == (set(), set())
-    assert shell_read_operands("git diff app.cfg")[0] == {"app.cfg"}
+    assert shell_read_operands("git diff app.cfg", "+x=1")[0] == {"app.cfg"}
+    # an untracked or unchanged file prints nothing: nothing was seen
+    assert shell_read_operands("git diff app.cfg", "")[0] == set()
 
 
 def test_shell_cd_and_subshells_resolve_operands():

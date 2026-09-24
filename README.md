@@ -145,7 +145,8 @@ Honest scope, from the design's leak audit:
 - **Completion coverage is only as good as target identification.** Each
   change whose target the gate can name (a `file_path`-style argument, a
   surface entry in free-text args, or a shell `> f`, `>> f`, `tee f`,
-  `sed -i ... f`) must be re-read after it happened (or deleted with `rm`), so re-reading `a.cfg`
+  `sed -i ... f`) must be re-read after it happened (or deleted with `rm`;
+  a move carries the debt to the new path; owed re-reads reset each turn), so re-reading `a.cfg`
   after editing `b.cfg` no longer passes. A change it can't name (a script,
   `mv`, `python fix.py`) falls back to freshness: any novel, relevant read
   after it counts. Treating those as owed would trap the agent on a target
@@ -282,6 +283,8 @@ Tools are sorted by what their output can prove. `Read`/`NotebookRead` are
 *content* tools: they are relevant to the path they were given, not to names
 their text mentions. `Glob` is a *listing* tool: it can ground an assertion
 but never verify a change (it shows a file exists, not what it now says).
+Shell commands are parsed by `grounding_gate.shell`, a small quote- and
+heredoc-aware lexer (heredoc bodies are data, `>` inside quotes is text).
 `Bash` counts as mutating, except for a command built only from known
 read-only programs (`cat`, `head`, `grep`, `diff`, `git diff`, ...; no
 redirects, `tee` or `$(...)`), which is treated as a read of the files it

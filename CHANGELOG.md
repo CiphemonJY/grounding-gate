@@ -43,6 +43,27 @@
     listing / mutating). `turn_loop` tracks list-form args as targets.
   - Behavior change: a user-declared *path* on the claim surface is no
     longer satisfied by a `Read` of some other file whose text mentions it.
+- Independent adversarial review (21 findings, all reproduced) and the fixes,
+  pinned by `tests/test_review_findings.py`:
+  - Shell commands are parsed by a new quote- and heredoc-aware lexer
+    (`grounding_gate.shell`) instead of regular expressions: heredoc bodies,
+    quoted `|`/`>`, `2>&1`, `&>`, `~`, `sed -i ''`, `git -C`/`--no-pager`
+    and env-assignment prefixes are handled.
+  - A mutating shell command's effects apply in order: a temp file written
+    then moved or deleted is never left owed (`jq ... > tmp && mv tmp f`),
+    and content the same command showed after its last change verifies it.
+  - Moves carry debt to the destination (`mv`, `git mv`, `mv -t`, directory
+    moves, MCP `move_file`); `rm -r` clears what was owed under a directory;
+    a failed command clears nothing.
+  - Paths are whole identifiers (`a.cfg~`, `my notes.txt`, `a.cfg:Zone...`
+    no longer alias); symbols from file text can't pay a file's debt
+    (`Symbol`); only content a command showed can pay, not files it listed,
+    counted, sent to `/dev/null`, or printed as a summary (`--stat`, `-q`,
+    `sed -n '$='`, `awk 'END{...}'`, `git show REV`).
+  - Adapter: the Bash `{"stdout": ...}` response is parsed; `WebFetch`/
+    `WebSearch` never verify a change; `Grep` is relevant only to files whose
+    lines it printed; owed re-reads and the completion claim are per turn;
+    a missing `tool_name` no longer crashes.
 - CI tests every supported Python (3.9-3.13), builds the sdist/wheel with
   `twine check`, and imports the installed wheel with no extras. The release
   workflow refuses a tag that doesn't match the package version.
