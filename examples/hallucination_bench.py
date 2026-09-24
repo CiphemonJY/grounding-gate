@@ -1456,16 +1456,30 @@ SEMANTIC = {
 }
 
 
+def _drive(coro):
+    """Run a hook coroutine that never awaits, without an event loop.
+
+    The hooks are ``async`` for the SDK but finish in one step; building an
+    event loop per call (``asyncio.run``) made the benchmark minutes long on
+    Windows. A hook that did suspend would be a bug here, so it raises.
+    """
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        return done.value
+    coro.close()
+    raise RuntimeError("hook awaited something; run it under asyncio instead")
+
+
 def sdk_verdict(events, surface):
     """Replay hook events through GateHooks; the LAST stop decides."""
-    import asyncio
     from grounding_gate.adapters.claude_agent_sdk import GateHooks
     gate = GateHooks(claim_surface=surface)
     hook = {"tool": gate.post_tool_use, "fail": gate.post_tool_use_failure,
             "prompt": gate.user_prompt_submit, "stop": gate.stop}
     out = None
     for kind, data in events:
-        out = asyncio.run(hook[kind](data, None, None))
+        out = _drive(hook[kind](data, None, None))
     return ACCEPT_LABEL if out == {} else REJECT_LABEL
 
 
