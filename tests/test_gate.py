@@ -183,6 +183,24 @@ def test_r2_completion_without_verified_rejected():
     assert B("completion", budget=3, grounded_this_turn=True) == REJECT
 
 
+def test_r2b_unknown_claim_type_fails_closed():
+    # a typo must never fall through to the exempt `none` ACCEPT
+    try:
+        B("assertoin", budget=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown claim_type was not rejected")
+
+
+def test_version_matches_pyproject():
+    import re
+    import grounding_gate
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    m = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+    assert m and grounding_gate.__version__ == m.group(1)
+
+
 def test_r3_grounded_but_budget_zero_rejected():
     assert B("assertion", budget=0, grounded_this_turn=True) == REJECT
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- `boundary_check` now fails CLOSED on an unknown `claim_type` (raises
+  `ValueError`). Previously a typo such as `"assertoin"` fell through to the
+  exempt `none` branch and was ACCEPTed with no grounding.
+- `grounding_gate.__version__` reported `0.4.0` in the 0.4.1 release; it now
+  matches `pyproject.toml`, and a test pins the two together.
+- README quickstart: the mutation bookkeeping now also clears
+  `verified_this_turn`, matching `turn_loop`. Without it, a verification taken
+  before a second mutation stayed latched and could ground a completion.
+- CI tests every supported Python (3.9-3.13), builds the sdist/wheel with
+  `twine check`, and imports the installed wheel with no extras. The release
+  workflow refuses a tag that doesn't match the package version.
+
 ## 0.4.1 — 2026-09-15
 
 - Packaging only; no functional change. Corrects the package author metadata,

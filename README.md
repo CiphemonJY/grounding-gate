@@ -78,6 +78,7 @@ state.grounded_this_turn |= obs["grounds_assertion"]
 state.verified_this_turn |= obs["grounds_completion"]
 if mutating:
     state.last_mutation_step = state.current_step   # a completion now needs a read AFTER this
+    state.verified_this_turn = False                # ...and earlier verification no longer counts
 
 # at every submit/conclude attempt — this must be the ONLY path to output:
 verdict = boundary_check({"claim_type": "completion", "content": answer}, state)

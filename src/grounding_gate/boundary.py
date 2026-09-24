@@ -32,6 +32,7 @@ from .classifier import classify_observation
 
 ACCEPT, REJECT = "ACCEPT", "REJECT"
 LEGAL_NEXT = ["qualifying_tool_call", "unverified_terminal"]
+CLAIM_TYPES = ("none", "assertion", "completion", "unverified")
 
 
 def boundary_check(terminal_attempt, state, verifier=None):
@@ -44,6 +45,11 @@ def boundary_check(terminal_attempt, state, verifier=None):
     ``unverified`` / ``none`` exits below never escalate — the floor is binding.
     """
     ct = terminal_attempt["claim_type"]        # none|assertion|completion|unverified
+    if ct not in CLAIM_TYPES:
+        # fail CLOSED: an unknown claim type (a typo like "assertoin") would
+        # otherwise fall through to the exempt ``none`` ACCEPT below
+        raise ValueError("unknown claim_type %r (expected one of %s)"
+                         % (ct, ", ".join(CLAIM_TYPES)))
 
     if ct == "unverified":                     # universal escape hatch (typed)
         state.halted = False                   # never escalated — the honest exit

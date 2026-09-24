@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.9", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         include:
           - os: windows-latest
             python-version: "3.13"
@@ -34,3 +34,21 @@ jobs:
         run: python examples/demo.py
       - name: Preset-tuning harness self-check (lcb-gate optional; exits 0 if absent)
         run: python examples/tune_presets.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - name: Wheel imports with no extras installed
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheel-venv/bin/python -c "import grounding_gate, grounding_gate.verifiers, grounding_gate.adapters.claude_agent_sdk; print(grounding_gate.__version__)"
