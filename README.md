@@ -287,7 +287,19 @@ read-only programs (`cat`, `head`, `grep`, `diff`, `git diff`, ...; no
 redirects, `tee` or `$(...)`), which is treated as a read of the files it
 operates on: `cat app.cfg` can verify an edit, `ls -l app.cfg` can only ground
 an assertion, and `echo app.cfg` or the pattern in `grep app.cfg notes.txt`
-counts for nothing. Symbols in content (`parse_config`, including the
+counts for nothing. What counts is what reached the agent: the last stage
+of a pipeline must pass lines through (`cat app.cfg | grep x` shows content;
+`cat app.cfg | wc -l`, `head app.cfg > /dev/null` and `grep -q` do not).
+`sed` and `awk` count as reads when they can only print (`sed -n '1,40p'`,
+`awk 'NR<=20'`), as does `python -m json.tool FILE`. `cd` inside a command,
+subshells and the session's working directory (the hook's `cwd`) are
+followed, so `cd conf && cat app.cfg` reads `conf/app.cfg`. `git show
+HEAD:app.cfg` is the committed copy, not the edit; a bare `git diff` counts
+for the files in its `+++ b/` headers. `Grep` in its default
+`files_with_matches` (or `count`) mode is a listing. The reference MCP
+filesystem server's tools (`mcp__<server>__read_text_file`, `write_file`,
+`list_directory`, ...) are classified like their built-in counterparts.
+Symbols in content (`parse_config`, including the
 `load_settings` in `cfg.load_settings()`) still ground claims about them;
 file names a document merely mentions do not. Override with
 `content_tools=` / `listing_tools=`.
@@ -320,8 +332,19 @@ check. Structural error rate per set, 200 seeds per family:
 | held-out 4 | 15 | 35.6% | 0.0% |
 | held-out 5 | 12 (+1 semantic) | 16.7% | 0.0% |
 | held-out 6 | 12 (+1 semantic) | 41.7% | 0.0% |
-| held-out 7 (newest) | 11 (+2 semantic) | 42.1% | 0.0% |
-| **all 112** | | **34.2%** | **0.0%** (1.8% with semantic pairs) |
+| held-out 7 | 11 (+2 semantic) | 42.1% | 0.0% |
+| held-out 8 | 17 | 57.1% | 0.0% |
+| held-out 9 | 16 | 43.8% | 0.0% |
+| held-out 10 | 12 | 56.7% | 0.0% |
+| held-out 11 | 11 | 44.5% | 0.0% |
+| held-out 12 (newest) | 12 | 47.7% | 0.0% |
+| **all 180** | | **40.4%** | **0.0%** (1.1% with semantic pairs) |
+
+Fresh sets keep finding new gaps: sets 8-12 each scored 7-42% against the
+gate as it stood before they were written (Grep's file-list mode, `sed -n`
+views, `cd` in commands, `git show REV:path`, output piped into `wc`). Each
+gap was fixed in the round after it was found, so read "0.0%" as "every
+known scenario", not as a bound on the next new one.
 
 Four *semantic* families are reported but kept out of the structural rate.
 They come in pairs whose transcripts are identical and whose right answer

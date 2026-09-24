@@ -56,16 +56,18 @@ callables themselves are plain async functions you can also register by hand.
 """
 
 import json
+import posixpath
 import re
 
 from ..boundary import ACCEPT, boundary_check
 from ..classifier import classify_observation
-from ..state import (GateState, extract_identifiers, shell_is_read_only,
+from ..state import (_PATH_KEYS, GateState, extract_identifiers, shell_is_read_only,
                      shell_read_operands, surface_hits)
 
-# Built-in SDK tools by consequence class. Unknown tools (including MCP tools)
-# are treated as NEITHER: they earn no grounding credit and record no
-# mutation — maximally conservative in both directions. Override per-agent.
+# Built-in SDK tools by consequence class. Unknown tools (MCP tools other than
+# the reference filesystem server's, see _MCP_FILESYSTEM) are treated as
+# NEITHER: they earn no grounding credit and record no mutation — maximally
+# conservative in both directions. Override per-agent.
 DEFAULT_READ_ONLY_TOOLS = frozenset(
     {"Read", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookRead"})
 # Read-only tools that report what EXISTS (names, paths), not what a file now
@@ -116,6 +118,46 @@ def _serialize(value):
 _PATH_LIKE = re.compile(r"/|\.[A-Za-z0-9]{1,8}$")
 
 
+# Tools of the reference MCP filesystem server, by what they can prove. MCP
+# tools arrive as mcp__<server>__<tool>, so any server name matches.
+_MCP_FILESYSTEM = {
+    "read_file": "content", "read_text_file": "content",
+    "read_multiple_files": "content",
+    "list_directory": "listing", "list_directory_with_sizes": "listing",
+    "directory_tree": "listing", "search_files": "listing",
+    "get_file_info": "listing",
+    "write_file": "mutating", "edit_file": "mutating", "move_file": "mutating",
+    "create_directory": "mutating",
+}
+
+
+def _mcp_class(tool):
+    """``content`` / ``listing`` / ``mutating`` for a known MCP filesystem
+    tool, else None (unknown tools stay neither, as before)."""
+    if not tool.startswith("mcp__"):
+        return None
+    return _MCP_FILESYSTEM.get(tool.rsplit("__", 1)[-1])
+
+
+_GREP_LISTING_MODES = ("files_with_matches", "count")
+
+
+def _grep_lists_files(tool, tool_input, response, result):
+    """True when a Grep call returned file names (its default
+    ``files_with_matches`` mode) or counts rather than matching lines."""
+    if tool != "Grep":
+        return False
+    mode = tool_input.get("output_mode") if isinstance(tool_input, dict) else None
+    if isinstance(response, dict):
+        mode = response.get("mode", mode)
+    if mode is not None:
+        return mode in _GREP_LISTING_MODES
+    lines = [ln.strip() for ln in str(result).splitlines() if ln.strip()]
+    return bool(lines) and all(
+        ":" not in ln and not ln.split()[1:] and _PATH_LIKE.search(ln)
+        for ln in lines)
+
+
 def _symbols(text):
     """Non-path identifiers in file content (``parse_config`` in the source
     that defines it), with dotted names also split into their parts so
@@ -135,7 +177,18 @@ def _content_identifiers(args, result):
     return extract_identifiers(args, "") | _symbols(result)
 
 
-def _shell_identifiers(args, result):
+def _absolutize(tool_input, cwd):
+    """Resolve relative path-key values (``{"file_path": "app.cfg"}``)
+    against the session's working directory, so ``app.cfg`` read from
+    /srv/proj can't be taken for /srv/proj/conf/app.cfg."""
+    if not cwd or not isinstance(tool_input, dict):
+        return tool_input
+    return {k: (posixpath.join(cwd, v) if k in _PATH_KEYS and isinstance(v, str)
+                and v and not v.startswith("/") else v)
+            for k, v in tool_input.items()}
+
+
+def _shell_identifiers(args, result, cwd=""):
     """Relevance for a read-only shell call: the files it operates on (and
     the ``path:`` prefixes a search prints), never a grep pattern or an echo
     argument. Only consulted for shell reads: a mutating call grounds
@@ -146,7 +199,7 @@ def _shell_identifiers(args, result):
         command = None
     if not isinstance(command, str):
         return extract_identifiers(args, result)
-    content, listed = shell_read_operands(command, result)
+    content, listed = shell_read_operands(command, result, cwd)
     # output is file content only when a content program ran (not for a
     # bare `echo load_settings`)
     return content | listed | (_symbols(result) if content else set())
@@ -225,7 +278,7 @@ class GateHooks:
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
         for tool in mutating_tools:
-            extractors.setdefault(tool, _shell_identifiers)
+            extractors.setdefault(tool, self._shell_extract)
         self.state = GateState.for_model_class(
             model_class, claim_surface=set(claim_surface),
             normalizers=dict(normalizers or {}), extractors=extractors)
@@ -243,6 +296,7 @@ class GateHooks:
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
+        self._cwd = ""   # session working directory, from hook inputs
 
     # ------------------------------------------------------------ hooks
 
@@ -253,7 +307,8 @@ class GateHooks:
         if input_data.get("agent_id") and not self.gate_subagents:
             return {}
         tool = input_data.get("tool_name", "")
-        tool_input = input_data.get("tool_input", "")
+        self._note_cwd(input_data)
+        tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
         # (mutation-epoch novelty — a fresh mutation re-opening the verifying
         # re-read — lives in classify_observation's hash tuple, not in the
         # text, so custom normalizers can't corrupt it)
@@ -263,14 +318,20 @@ class GateHooks:
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
         shell_read = self._is_shell_read(tool, tool_input)
-        read_only = tool in self.read_only_tools or shell_read
+        mcp = _mcp_class(tool)
+        if mcp == "content":
+            self.state.extractors.setdefault(tool, _content_identifiers)
+        read_only = (tool in self.read_only_tools or shell_read
+                     or mcp in ("content", "listing"))
 
         obs = classify_observation(tool, args, result, self.state, read_only)
         if shell_read and not surface_hits(
-                shell_read_operands(tool_input["command"], result)[0],
+                shell_read_operands(tool_input["command"], result, self._cwd)[0],
                 self.state.claim_surface):
             obs["grounds_completion"] = False   # listed, not shown
-        if tool in self.listing_tools:
+        if (tool in self.listing_tools or mcp == "listing"
+                or _grep_lists_files(tool, tool_input,
+                                     input_data.get("tool_response"), result)):
             # a listing shows the file exists, not what the change wrote
             obs["grounds_completion"] = False
         qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
@@ -289,7 +350,7 @@ class GateHooks:
                  "tier": "verified" if obs["grounds_completion"] else "observed"})
             if obs["grounds_completion"]:
                 self.state.last_verification_step = self.state.current_step
-        if tool in self.mutating_tools and not shell_read:
+        if (tool in self.mutating_tools and not shell_read) or mcp == "mutating":
             self._record_mutation(tool_input)
         return {}
 
@@ -302,9 +363,11 @@ class GateHooks:
             return {}
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
+        self._note_cwd(input_data)
         tool = input_data.get("tool_name", "")
-        tool_input = input_data.get("tool_input", "")
-        if tool in self.mutating_tools and not self._is_shell_read(tool, tool_input):
+        tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
+        if ((tool in self.mutating_tools and not self._is_shell_read(tool, tool_input))
+                or _mcp_class(tool) == "mutating"):
             self._record_mutation(tool_input)
         return {}
 
@@ -406,11 +469,21 @@ class GateHooks:
         return (tool in self.mutating_tools and isinstance(command, str)
                 and shell_is_read_only(command))
 
+    def _note_cwd(self, input_data):
+        """Track the session's working directory (every SDK hook input
+        carries ``cwd``); relative paths resolve against it."""
+        cwd = input_data.get("cwd")
+        if isinstance(cwd, str) and cwd.startswith("/"):
+            self._cwd = cwd
+
+    def _shell_extract(self, args, result):
+        return _shell_identifiers(args, result, self._cwd)
+
     def _record_mutation(self, tool_input):
         # a NEW mutation invalidates any earlier verification, its targets are
         # owed a re-read, and mutated identifiers join the claim surface so
         # only reads of THOSE count as verification
-        self.state.note_mutation(tool_input)
+        self.state.note_mutation(tool_input, self._cwd)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier

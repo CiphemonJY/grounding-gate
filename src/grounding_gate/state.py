@@ -5,6 +5,7 @@ variance is absorbed as integers, not prose.
 """
 
 import fnmatch
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -91,7 +92,7 @@ class GateState:
                 "budget meaningless" % (refill, cap))
         return cls(budget=cap, cap=cap, refill=refill, **kw)
 
-    def note_mutation(self, args):
+    def note_mutation(self, args, cwd=""):
         """Record a mutating call at ``current_step``.
 
         A completion now needs a fresh read AFTER this step, earlier
@@ -104,8 +105,8 @@ class GateState:
         if isinstance(args, dict) and isinstance(args.get("command"), str):
             # a deleted file can never be re-read: drop what it owed
             self.pending_verification -= _removed(
-                shell_remove_targets(args["command"]), self.pending_verification)
-        self.pending_verification |= mutation_targets(args, self.claim_surface)
+                shell_remove_targets(args["command"], cwd), self.pending_verification)
+        self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
         self.claim_surface |= mutation_identifiers(args)
 
     def observation_identifiers(self, tool_name, args, result):
@@ -258,6 +259,9 @@ def extract_identifiers(args, result):
 def _canonical(ident):
     while ident.startswith("./"):
         ident = ident[2:]
+    if "/" in ident:
+        # src/../app.cfg is app.cfg (normpath keeps a URL's leading //)
+        ident = posixpath.normpath(ident)
     return ident
 
 
@@ -322,7 +326,7 @@ def mutation_identifiers(tool_input):
     return extract_identifiers(str(tool_input), "")
 
 
-def mutation_targets(args, surface):
+def mutation_targets(args, surface, cwd=""):
     """What a mutating call verifiably changed, for per-target coverage.
 
     Path-key values of a structured call (``{"file_path": ...}``), or, for
@@ -336,19 +340,66 @@ def mutation_targets(args, surface):
                    if k in _PATH_KEYS and isinstance(v, (str, int, float))
                    for i in extract_identifiers(str(v), "")}
         if not targets and isinstance(args.get("command"), str):
-            targets = shell_write_targets(args["command"])
+            targets = shell_write_targets(args["command"], cwd)
         return targets
     if isinstance(args, str):
         return surface_hits(extract_identifiers(args, ""), surface)
+    if isinstance(args, (list, tuple)):
+        return {t for a in args for t in mutation_targets(a, surface, cwd)}
     return set()
 
 
 _SHELL_SEP = re.compile(r"\|\||&&|[;|&\n]")
+_SHELL_SEP_KEEP = re.compile(r"(\|\||&&|[;|&\n])")
 # plain redirects only: `2>err.log` and `>&2` are diagnostics, not the edit
 _REDIRECT = re.compile(r"(?<![\d&>])>>?[ \t]*([^\s;|&<>]+)")
 
 
-def shell_write_targets(command):
+def _segments(command, cwd=""):
+    """``(segment, argv, resolve, piped)`` per simple command in ``command``;
+    ``piped`` is True when its output feeds the next command through ``|``.
+
+    ``argv`` is None when the segment doesn't parse. ``resolve(path)`` maps a
+    relative path through ``cwd`` (the session's working directory, when
+    known) and any earlier ``cd`` in the same command
+    (``cd conf && cat app.cfg`` reads ``conf/app.cfg``); it returns None
+    once a ``cd`` goes somewhere unknown (``cd``, ``cd -``, ``cd ~``,
+    ``cd $DIR``), so callers skip what they can't place.
+    """
+    cwd, saved = posixpath.normpath(cwd) if cwd else "", []
+    pieces = _SHELL_SEP_KEEP.split(command)
+    for k in range(0, len(pieces), 2):
+        segment = pieces[k]
+        piped = k + 1 < len(pieces) and pieces[k + 1] == "|"
+        # `(cd conf && cat x)`: a subshell's cd ends with its closing paren
+        body = _HARMLESS_REDIRECTS.sub("", segment).strip()
+        opens = len(body) - len(body.lstrip("("))
+        closes = len(body) - len(body.rstrip(")"))
+        saved += [cwd] * opens
+        try:
+            argv = shlex.split(body.strip("()"))
+        except ValueError:
+            argv = None
+
+        def resolve(path, cwd=cwd):
+            if path.startswith("/") or cwd == "":
+                return path
+            return None if cwd is None else posixpath.join(cwd, path)
+
+        yield segment, argv, resolve, piped
+        if argv and argv[0] == "cd":
+            target = argv[1] if len(argv) > 1 else "~"
+            if target == "-" or set(target) & set("~$`"):
+                cwd = None
+            elif target.startswith("/"):
+                cwd = posixpath.normpath(target)
+            elif cwd is not None:
+                cwd = posixpath.normpath(posixpath.join(cwd, target))
+        for _ in range(min(closes, len(saved))):
+            cwd = saved.pop()
+
+
+def shell_write_targets(command, cwd=""):
     """Files a shell command explicitly writes, from a few unambiguous forms:
     ``> FILE``, ``>> FILE``, ``tee [-a] FILE...`` and ``sed -i ... FILE...``.
 
@@ -358,12 +409,9 @@ def shell_write_targets(command):
     matched by a later read would trap the agent.
     """
     out = set()
-    for segment in _SHELL_SEP.split(command):
+    for segment, argv, resolve, _ in _segments(command, cwd):
         files = _REDIRECT.findall(segment)
-        try:
-            argv = shlex.split(segment)
-        except ValueError:
-            argv = []
+        argv = argv or []
         if argv and argv[0] == "tee":
             files += [a for a in argv[1:] if not a.startswith("-")]
         elif argv and argv[0] == "sed" and any(
@@ -377,7 +425,8 @@ def shell_write_targets(command):
                 elif not a.startswith("-"):
                     rest.append(a)
             files += rest if has_e else rest[1:]   # first operand is the script
-        out |= {f for f in files if f != "/dev/null" and not set(f) & set("$*?`{")}
+        out |= {r for r in (resolve(f) for f in files
+                            if f != "/dev/null" and not set(f) & set("$*?`{")) if r}
     return _identifiers_of(out)
 
 
@@ -386,7 +435,7 @@ def shell_write_targets(command):
 _READ_ONLY_PROGRAMS = frozenset({
     "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "diff",
     "cmp", "stat", "file", "nl", "cut", "tr", "jq", "tree", "du", "df", "pwd",
-    "cd", "echo", "printf", "which", "md5sum", "sha256sum"})
+    "cd", "echo", "printf", "which", "md5sum", "sha256sum", "true", ":"})
 _READ_ONLY_GIT = frozenset({"diff", "show", "log", "status", "blame", "ls-files"})
 _HARMLESS_REDIRECTS = re.compile(r"\d?>\s*/dev/null|\d?>&\d")
 
@@ -404,18 +453,15 @@ def _removed(operands, pending):
     return hits
 
 
-def shell_remove_targets(command):
+def shell_remove_targets(command, cwd=""):
     """Path operands of any ``rm`` in a shell command, globs included
     (``tmp*.txt``); operands built from variables are skipped."""
     out = set()
-    for segment in _SHELL_SEP.split(command):
-        try:
-            argv = shlex.split(segment)
-        except ValueError:
-            continue
+    for _, argv, resolve, _ in _segments(command, cwd):
         if argv and argv[0] == "rm":
-            out |= {a for a in argv[1:]
-                    if not a.startswith("-") and not set(a) & set("$`{")}
+            out |= {r for r in (resolve(a) for a in argv[1:]
+                                if not a.startswith("-") and not set(a) & set("$`{"))
+                    if r}
     return out
 
 
@@ -425,14 +471,58 @@ def shell_remove_targets(command):
 # _READ_ONLY_PROGRAMS (echo, pwd, ...) observes no file at all.
 _CONTENT_PROGRAMS = frozenset({"cat", "head", "tail", "nl", "diff", "cmp",
                                "cut", "md5sum", "sha256sum"})
+# ...of which these print the lines themselves, not a digest or a verdict
+_PASS_THROUGH_PROGRAMS = frozenset({"cat", "head", "tail", "nl", "diff", "cut", "tr",
+                                    "json.tool"})
 _PATTERN_PROGRAMS = frozenset({"grep", "egrep", "fgrep", "rg", "jq"})
+# sed/awk run as pure viewers (see _is_viewer): script first, then files
+_VIEWER_PROGRAMS = frozenset({"sed", "awk"})
+# sed scripts that only print: "p", "5,9p", "$p", "/re/p", "="
+_SED_ADDR = r"(?:\d+|\$|/[^/]*/)"
+_SED_PRINT_ONLY = re.compile(
+    r"^\s*(?:%s(?:\s*,\s*%s)?)?\s*[p=]?\s*$" % (_SED_ADDR, _SED_ADDR))
+_AWK_SIDE_EFFECTS = ("system", "getline", "|", ">", "close", "fflush")
+
+
+_PYTHON = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+
+
+def _is_json_tool(argv):
+    """``python -m json.tool [FILE]``: pretty-prints only. A second operand
+    would be an output file, so that form doesn't qualify."""
+    return (len(argv) >= 3 and bool(_PYTHON.match(argv[0]))
+            and argv[1:3] == ["-m", "json.tool"]
+            and len([a for a in argv[3:] if not a.startswith("-")]) <= 1)
+
+
+def _is_viewer(argv):
+    """``sed`` with no in-place flag and print-only scripts, or ``awk`` whose
+    program can't run commands or write files: both only print file content."""
+    args = argv[1:]
+    if argv[0] == "sed":
+        if any(a.startswith("-i") or a.startswith("--in-place") or a in ("-f", "--file")
+               for a in args):
+            return False
+        scripts = [args[k + 1] for k, a in enumerate(args[:-1])
+                   if a in ("-e", "--expression")]
+        if not scripts:
+            operands = [a for a in args if not a.startswith("-")]
+            scripts = operands[:1]
+        return bool(scripts) and all(_SED_PRINT_ONLY.match(x) for x in scripts)
+    if argv[0] == "awk":
+        if "-f" in args:
+            return False
+        operands = [a for a in args if not a.startswith("-")]
+        return bool(operands) and not any(t in operands[0] for t in _AWK_SIDE_EFFECTS)
+    return False
 _LISTING_PROGRAMS = frozenset({"ls", "stat", "file", "wc", "du", "tree"})
 _GIT_CONTENT = frozenset({"diff", "show", "blame"})
 _GIT_LISTING = frozenset({"status", "log", "ls-files"})
+_DIFF_NEW_FILE = re.compile(r"^\+\+\+ b/(\S+)", re.M)
 _OUTPUT_PATH = re.compile(r"^([^\s:]+):", re.M)
 
 
-def shell_read_operands(command, output=""):
+def shell_read_operands(command, output="", cwd=""):
     """``(content, listed)``: identifiers of the files a read-only shell
     command shows the content of, and of those it only lists.
 
@@ -442,27 +532,70 @@ def shell_read_operands(command, output=""):
     matched.
     """
     content, listed = set(), set()
-    for segment in _SHELL_SEP.split(_HARMLESS_REDIRECTS.sub("", command)):
-        try:
-            argv = shlex.split(segment)
-        except ValueError:
-            continue
+    stage_content, stage_listed = set(), set()   # of the current pipeline
+    for segment, argv, resolve, piped in _segments(command, cwd):
         if not argv:
             continue
+        seen_content, seen_listed = set(), set()
         prog, args = argv[0], argv[1:]
         if prog == "git" and args:
             prog, args = "git " + args[0], args[1:]
+        elif _is_json_tool(argv):
+            prog, args = "json.tool", argv[3:]
         operands = [a for a in args if not a.startswith("-")]
-        if prog in _PATTERN_PROGRAMS:
+        if prog in _VIEWER_PROGRAMS:
+            # the script comes first unless given with -e / -f
+            seen_content.update(operands if any(a in ("-e", "-f") for a in args)
+                                else operands[1:])
+        elif prog in _PATTERN_PROGRAMS:
             if not any(a in ("-e", "-f") or a.startswith("--regexp") for a in args):
                 operands = operands[1:]   # the first operand is the pattern
-            content.update(_OUTPUT_PATH.findall(str(output)))
-            content.update(operands)
-        elif prog in _CONTENT_PROGRAMS or prog[4:] in _GIT_CONTENT:
-            content.update(operands)
-        elif prog in _LISTING_PROGRAMS or prog[4:] in _GIT_LISTING:
-            listed.update(operands)
+            seen_content.update(_OUTPUT_PATH.findall(str(output)))
+            seen_content.update(operands)
+        elif prog.startswith("git ") and prog[4:] in _GIT_CONTENT:
+            # REV:path is a committed copy, not the working tree; a diff
+            # names the working-tree files it shows in its +++ headers
+            seen_content.update(o for o in operands if ":" not in o)
+            if prog == "git diff":
+                seen_content.update(_DIFF_NEW_FILE.findall(str(output)))
+        elif prog in _CONTENT_PROGRAMS or prog == "json.tool":
+            seen_content.update(operands)
+        elif prog in _LISTING_PROGRAMS or (
+                prog.startswith("git ") and prog[4:] in _GIT_LISTING):
+            seen_listed.update(operands)
+        stage_content |= {r for r in map(resolve, seen_content) if r}
+        stage_listed |= {r for r in map(resolve, seen_listed) if r}
+        if piped:
+            continue
+        # the pipeline's LAST stage decides what the agent actually saw:
+        # content only if it passes lines through to the agent
+        if _shows_content(prog, args) and not _STDOUT_DISCARDED.search(segment):
+            content |= stage_content
+        else:
+            listed |= stage_content
+        listed |= stage_listed
+        stage_content, stage_listed = set(), set()
     return _identifiers_of(content), _identifiers_of(listed)
+
+
+# stdout (not just stderr) thrown away: `> /dev/null`, `&> /dev/null`
+_STDOUT_DISCARDED = re.compile(r"(?:^|[^\d>&])&?>\s*/dev/null")
+_QUIET_FLAGS = frozenset("qclL")   # grep/rg: quiet, count, files-only
+
+
+def _shows_content(prog, args):
+    """Whether a pipeline's last program passes file lines to the agent
+    (``cat``, ``head``, ``grep``, ...) rather than a count, a checksum,
+    or nothing (``wc``, ``md5sum``, ``grep -q``)."""
+    if prog in _PATTERN_PROGRAMS:
+        return not any(
+            a in ("--quiet", "--silent", "--count", "--files-with-matches",
+                  "--files-without-match")
+            or (a.startswith("-") and not a.startswith("--")
+                and set(a[1:]) & _QUIET_FLAGS)
+            for a in args)
+    return (prog in _PASS_THROUGH_PROGRAMS or prog in _VIEWER_PROGRAMS
+            or (prog.startswith("git ") and prog[4:] in _GIT_CONTENT))
 
 
 def _identifiers_of(paths):
@@ -479,10 +612,8 @@ def shell_is_read_only(command):
     if ">" in command:
         return False
     saw_program = False
-    for segment in _SHELL_SEP.split(command):
-        try:
-            argv = shlex.split(segment)
-        except ValueError:
+    for _, argv, _, _ in _segments(command):
+        if argv is None:
             return False
         if not argv:
             continue
@@ -490,6 +621,11 @@ def shell_is_read_only(command):
         if argv[0] == "git":
             if len(argv) < 2 or argv[1] not in _READ_ONLY_GIT:
                 return False
+        elif argv[0] in _VIEWER_PROGRAMS:
+            if not _is_viewer(argv):
+                return False
+        elif _is_json_tool(argv):
+            pass
         elif argv[0] not in _READ_ONLY_PROGRAMS:
             return False
     return saw_program

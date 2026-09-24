@@ -10,11 +10,11 @@
 - README quickstart: the mutation bookkeeping now also clears
   `verified_this_turn`, matching `turn_loop`. Without it, a verification taken
   before a second mutation stayed latched and could ground a completion.
-- New labeled benchmark, `examples/hallucination_bench.py`: 112 transcript
-  families (design set + 7 held-out sets written round by round), each run
+- New labeled benchmark, `examples/hallucination_bench.py`: 180 transcript
+  families (design set + 12 held-out sets written round by round), each run
   over seeded variations through `turn_loop` and the Agent SDK adapter. The
   structural error rate (leaked ungrounded claims + blocked grounded ones)
-  goes from 34.2% on 0.4.1 to 0.0%; CI fails above 5%. Changes it drove:
+  goes from 40.4% on 0.4.1 to 0.0%; CI fails above 5%. Changes it drove:
   - Relevance matches paths by trailing components (`./app.cfg`,
     `proj/app.cfg`, `/srv/proj/app.cfg`), but not other directories or URLs.
   - Per-target completion coverage: every change with a nameable target must
@@ -32,6 +32,15 @@
     operands instead of as mutations; shell writes via `>`, `>>`, `tee` and
     `sed -i` are tracked as targets. New `content_tools=` / `listing_tools=`
     arguments.
+  - Shell reads follow what reaches the agent: `sed -n`/`awk` print-only
+    views and `python -m json.tool FILE` count; output piped into `wc`,
+    sent to `/dev/null`, or from `grep -q/-c/-l` does not. `cd`, subshells
+    and the hook's `cwd` are followed when resolving paths; `..` is
+    normalized. `git show REV:path` never verifies; a bare `git diff`
+    credits the files in its `+++ b/` headers.
+  - Adapter: `Grep` in `files_with_matches`/`count` mode is a listing; the
+    reference MCP filesystem server's tools are classified (content /
+    listing / mutating). `turn_loop` tracks list-form args as targets.
   - Behavior change: a user-declared *path* on the claim surface is no
     longer satisfied by a `Read` of some other file whose text mentions it.
 - CI tests every supported Python (3.9-3.13), builds the sdist/wheel with

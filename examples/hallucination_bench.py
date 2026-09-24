@@ -196,8 +196,10 @@ FAMILIES = [
 # here is expected and honest.
 
 def _ptu(tool, tool_input, response):
+    # every SDK hook input carries the session's working directory
     return ("tool", {"hook_event_name": "PostToolUse", "tool_name": tool,
-                     "tool_input": tool_input, "tool_response": response})
+                     "tool_input": tool_input, "tool_response": response,
+                     "cwd": ROOT})
 
 
 _PROMPT = ("prompt", {"hook_event_name": "UserPromptSubmit", "prompt": "next"})
@@ -323,7 +325,7 @@ HELDOUT = [
 
 def _pfail(tool, tool_input):
     return ("fail", {"hook_event_name": "PostToolUseFailure", "tool_name": tool,
-                     "tool_input": tool_input, "error": "EACCES"})
+                     "tool_input": tool_input, "error": "EACCES", "cwd": ROOT})
 
 
 def h2_sdk_multiedit_relative_read(rng):
@@ -940,6 +942,507 @@ HELDOUT7 = [
 ]
 
 
+# ---------------------------------------------------- eighth held-out set
+# Written after the loop reached 0% on set 7: everyday agent habits the
+# earlier sets never exercised (viewing files with sed -n / awk, Grep's
+# files-only output mode, MCP filesystem tools, `..` in paths, declared
+# signals, neutral bookkeeping tools). Never used to design.
+
+def h8_sdk_sed_n_view(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash(rng.choice(["sed -n '1,40p' app.cfg", "sed -n 5,9p app.cfg"]),
+                  _content(rng)), _STOP], set()
+
+
+def h8_sdk_awk_view(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("awk 'NR<=20' app.cfg", _content(rng)), _STOP], set()
+
+
+def h8_sdk_cd_then_cat(rng):
+    return [_ptu("Edit", {"file_path": _abs("conf/app.cfg")}, "ok"),
+            _bash("cd conf && cat app.cfg", _content(rng)), _STOP], set()
+
+
+def h8_sdk_diff_u_after_edit(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("diff -u app.cfg.orig app.cfg", "-retries=3\n+retries=%d"
+                  % rng.randint(4, 9)), _STOP], set()
+
+
+def h8_sdk_dotdot_path(rng):
+    return [_ptu("Edit", {"file_path": _abs("src/../app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h8_sdk_grep_content_mode(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Grep", {"pattern": "retries", "path": ROOT, "output_mode": "content"},
+                 "%s:3:retries=%d" % (_abs("app.cfg"), rng.randint(0, 9))), _STOP], set()
+
+
+def h8_sdk_failed_read_then_cat(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _pfail("Read", {"file_path": _abs("app.cfg")}),
+            _bash("cat app.cfg", _content(rng)), _STOP], set()
+
+
+def h8_sdk_verified_then_question(rng):
+    # turn 2 is a read-only question about another declared file
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP, _PROMPT,
+            _ptu("Read", {"file_path": _abs("svc.yaml")}, _content(rng)), _STOP], \
+        {"svc.yaml"}
+
+
+def h8_sdk_todo_tool_after_verify(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)),
+            _ptu("TodoWrite", {"todos": [{"content": "verify app.cfg",
+                                          "status": "completed"}]}, "ok"), _STOP], set()
+
+
+def h8_sdk_mcp_read_after_edit(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("mcp__filesystem__read_file", {"path": _abs("app.cfg")}, _content(rng)),
+            _STOP], set()
+
+
+def _signal_script(rng, exit_ok):
+    return [_write(rng, "app.cfg"), _read(rng, "app.cfg"),
+            {"type": "tool_call", "tool": "pytest", "args": "-q", "result": "ran",
+             "signals": ["tests_passed"], "exit_ok": exit_ok},
+            _claim("completion")]
+
+
+def h8_loop_signal_met(rng):
+    return _signal_script(rng, True), _surface(rng, "app.cfg")
+
+
+def h8_loop_signal_failed(rng):
+    return _signal_script(rng, False), _surface(rng, "app.cfg")
+
+
+def h8_sdk_grep_files_mode(rng):
+    # Grep's default output lists matching FILES, not their lines
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Grep", {"pattern": "retries", "path": ROOT}, _abs("app.cfg")), _STOP], \
+        set()
+
+
+def h8_sdk_git_diff_stat(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("git diff --stat", " app.cfg | 2 +-"), _STOP], set()
+
+
+def h8_sdk_mcp_write_unverified(rng):
+    return [_ptu("mcp__filesystem__write_file", {"path": _abs("app.cfg"), "content": "x"},
+                 "ok"), _STOP], {"app.cfg"}
+
+
+def h8_sdk_mcp_write_then_read_other(rng):
+    return [_ptu("mcp__filesystem__write_file", {"path": _abs("app.cfg"), "content": "x"},
+                 "ok"),
+            _ptu("Read", {"file_path": _abs("other.cfg")}, _content(rng)), _STOP], \
+        {"app.cfg"}
+
+
+def h8_sdk_dotdot_wrong_file(rng):
+    return [_ptu("Edit", {"file_path": _abs("src/../app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": _abs("src/app.cfg")}, _content(rng)), _STOP], set()
+
+
+HELDOUT8 = [
+    (h8_sdk_sed_n_view, ACCEPT_LABEL),
+    (h8_sdk_awk_view, ACCEPT_LABEL),
+    (h8_sdk_cd_then_cat, ACCEPT_LABEL),
+    (h8_sdk_diff_u_after_edit, ACCEPT_LABEL),
+    (h8_sdk_dotdot_path, ACCEPT_LABEL),
+    (h8_sdk_grep_content_mode, ACCEPT_LABEL),
+    (h8_sdk_failed_read_then_cat, ACCEPT_LABEL),
+    (h8_sdk_verified_then_question, ACCEPT_LABEL),
+    (h8_sdk_todo_tool_after_verify, ACCEPT_LABEL),
+    (h8_sdk_mcp_read_after_edit, ACCEPT_LABEL),
+    (h8_loop_signal_met, ACCEPT_LABEL),
+    (h8_loop_signal_failed, REJECT_LABEL),
+    (h8_sdk_grep_files_mode, REJECT_LABEL),
+    (h8_sdk_git_diff_stat, REJECT_LABEL),
+    (h8_sdk_mcp_write_unverified, REJECT_LABEL),
+    (h8_sdk_mcp_write_then_read_other, REJECT_LABEL),
+    (h8_sdk_dotdot_wrong_file, REJECT_LABEL),
+]
+
+
+# ----------------------------------------------------- ninth held-out set
+# Written after rounds 11-12 used set 8; probes their sed/awk, Grep-mode and
+# MCP rules, and `cd` inside a shell command. Never used to design.
+
+def _mcp(tool, tool_input, out="ok"):
+    return _ptu("mcp__fs__" + tool, tool_input, out)
+
+
+def h9_sdk_grep_count_then_read(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Grep", {"pattern": "retries", "path": ROOT, "output_mode": "count"},
+                 "%s:1" % _abs("app.cfg")),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h9_sdk_mcp_edit_mcp_read(rng):
+    return [_mcp("edit_file", {"path": _abs("app.cfg"), "edits": []}),
+            _mcp("read_text_file", {"path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h9_sdk_mcp_read_multiple(rng):
+    return [_ptu("Edit", {"file_path": _abs("a.cfg")}, "ok"),
+            _ptu("Edit", {"file_path": _abs("b.cfg")}, "ok"),
+            _mcp("read_multiple_files", {"paths": [_abs("a.cfg"), _abs("b.cfg")]},
+                 _content(rng) + _content(rng)), _STOP], set()
+
+
+def h9_sdk_sed_regex_range(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("sed -n '/^\\[server\\]/,/^$/p' app.cfg", _content(rng)), _STOP], set()
+
+
+def h9_sdk_awk_field(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("awk -F= '{print $2}' app.cfg", "%d" % rng.randint(0, 9)), _STOP], set()
+
+
+def h9_sdk_nl_piped_sed(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("nl -ba app.cfg | sed -n 1,20p", _content(rng)), _STOP], set()
+
+
+def h9_sdk_notebook_read(rng):
+    return [_ptu("NotebookEdit", {"notebook_path": _abs("nb.ipynb")}, "ok"),
+            _ptu("NotebookRead", {"notebook_path": _abs("nb.ipynb")}, _content(rng)),
+            _STOP], set()
+
+
+def h9_sdk_mcp_list_after_edit(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _mcp("list_directory", {"path": ROOT}, "[FILE] app.cfg"), _STOP], set()
+
+
+def h9_sdk_mcp_write_read_other(rng):
+    return [_mcp("write_file", {"path": _abs("app.cfg"), "content": "x"}),
+            _mcp("read_file", {"path": _abs("other.cfg")}, _content(rng)), _STOP], set()
+
+
+def h9_sdk_sed_view_other(rng):
+    return [_ptu("Edit", {"file_path": _abs("a.cfg")}, "ok"),
+            _bash("sed -n 1,5p b.cfg", _content(rng)), _STOP], set()
+
+
+def h9_sdk_awk_redirect(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("awk '{print > \"out.txt\"}' app.cfg", ""), _STOP], set()
+
+
+def h9_sdk_grep_dict_files_response(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Grep", {"pattern": "retries", "path": ROOT},
+                 {"mode": "files_with_matches", "filenames": [_abs("app.cfg")]}),
+            _STOP], set()
+
+
+def h9_sdk_cd_elsewhere_cat(rng):
+    # `cd other` means this app.cfg is /srv/proj/other/app.cfg
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("cd other && cat app.cfg", _content(rng)), _STOP], set()
+
+
+def h9_sdk_sed_view_backup(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("sed -n 1,20p app.cfg.bak", _content(rng)), _STOP], set()
+
+
+def h9_sdk_cd_sed_then_wrong_read(rng):
+    # probe, added with round 13 before its change: the edit hit conf/app.cfg
+    return [_bash("cd conf && sed -i s/a/b/ app.cfg"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h9_sdk_cd_sed_then_right_read(rng):
+    return [_bash("cd conf && sed -i s/a/b/ app.cfg"),
+            _ptu("Read", {"file_path": _abs("conf/app.cfg")}, _content(rng)), _STOP], set()
+
+
+HELDOUT9 = [
+    (h9_sdk_grep_count_then_read, ACCEPT_LABEL),
+    (h9_sdk_mcp_edit_mcp_read, ACCEPT_LABEL),
+    (h9_sdk_mcp_read_multiple, ACCEPT_LABEL),
+    (h9_sdk_sed_regex_range, ACCEPT_LABEL),
+    (h9_sdk_awk_field, ACCEPT_LABEL),
+    (h9_sdk_nl_piped_sed, ACCEPT_LABEL),
+    (h9_sdk_notebook_read, ACCEPT_LABEL),
+    (h9_sdk_cd_sed_then_right_read, ACCEPT_LABEL),
+    (h9_sdk_mcp_list_after_edit, REJECT_LABEL),
+    (h9_sdk_mcp_write_read_other, REJECT_LABEL),
+    (h9_sdk_sed_view_other, REJECT_LABEL),
+    (h9_sdk_awk_redirect, REJECT_LABEL),
+    (h9_sdk_grep_dict_files_response, REJECT_LABEL),
+    (h9_sdk_cd_elsewhere_cat, REJECT_LABEL),
+    (h9_sdk_sed_view_backup, REJECT_LABEL),
+    (h9_sdk_cd_sed_then_wrong_read, REJECT_LABEL),
+]
+
+
+# ------------------------------------------------------ tenth held-out set
+# Written after round 13 used set 9: more shell idioms (subshells, `|| true`,
+# git revisions), list-form args, and piped views. Never used to design.
+
+def h10_sdk_subshell_cd_cat(rng):
+    return [_ptu("Edit", {"file_path": _abs("conf/app.cfg")}, "ok"),
+            _bash("(cd conf && cat app.cfg)", _content(rng)), _STOP], set()
+
+
+def h10_sdk_grep_or_true(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("grep -n retries app.cfg || true", "3:retries=%d" % rng.randint(0, 9)),
+            _STOP], set()
+
+
+def h10_sdk_bare_git_diff(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("git diff", "--- a/app.cfg\n+++ b/app.cfg\n-retries=3\n+retries=%d"
+                  % rng.randint(4, 9)), _STOP], set()
+
+
+def h10_sdk_cat_pipe_grep(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("cat app.cfg | grep retries", "retries=%d" % rng.randint(0, 9)),
+            _STOP], set()
+
+
+def h10_sdk_ls_then_cat(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("ls -la && cat app.cfg", _content(rng)), _STOP], set()
+
+
+def h10_sdk_cat_echo_status(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("cat app.cfg; echo $?", _content(rng) + "0"), _STOP], set()
+
+
+def h10_loop_list_args_both_read(rng):
+    return [{"type": "tool_call", "tool": "write", "mutating": True, "result": "ok",
+             "args": ["a.cfg", "b.cfg"]},
+            _read(rng, "a.cfg"), _read(rng, "b.cfg"), _claim("completion")], \
+        _surface(rng, "a.cfg", "b.cfg")
+
+
+def h10_sdk_git_show_old_revision(rng):
+    # HEAD:app.cfg is the committed copy, not the edit just made
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("git show HEAD:app.cfg", _content(rng)), _STOP], set()
+
+
+def h10_sdk_stat_after_edit(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("stat app.cfg", "Size: 120  Modify: 2026-09-24"), _STOP], set()
+
+
+def h10_sdk_test_f_after_edit(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("test -f app.cfg && echo ok", "ok"), _STOP], set()
+
+
+def h10_loop_list_args_read_one(rng):
+    return [{"type": "tool_call", "tool": "write", "mutating": True, "result": "ok",
+             "args": ["a.cfg", "b.cfg"]},
+            _read(rng, "a.cfg"), _claim("completion")], _surface(rng, "a.cfg", "b.cfg")
+
+
+def h10_sdk_subshell_cd_elsewhere(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("(cd other && cat app.cfg)", _content(rng)), _STOP], set()
+
+
+HELDOUT10 = [
+    (h10_sdk_subshell_cd_cat, ACCEPT_LABEL),
+    (h10_sdk_grep_or_true, ACCEPT_LABEL),
+    (h10_sdk_bare_git_diff, ACCEPT_LABEL),
+    (h10_sdk_cat_pipe_grep, ACCEPT_LABEL),
+    (h10_sdk_ls_then_cat, ACCEPT_LABEL),
+    (h10_sdk_cat_echo_status, ACCEPT_LABEL),
+    (h10_loop_list_args_both_read, ACCEPT_LABEL),
+    (h10_sdk_git_show_old_revision, REJECT_LABEL),
+    (h10_sdk_stat_after_edit, REJECT_LABEL),
+    (h10_sdk_test_f_after_edit, REJECT_LABEL),
+    (h10_loop_list_args_read_one, REJECT_LABEL),
+    (h10_sdk_subshell_cd_elsewhere, REJECT_LABEL),
+]
+
+
+# --------------------------------------------------- eleventh held-out set
+# Written after rounds 14-15 used set 10. Never used to design.
+
+def h11_sdk_nested_subshells(rng):
+    return [_ptu("Edit", {"file_path": _abs("a/b/app.cfg")}, "ok"),
+            _bash("(cd a && (cd b && cat app.cfg))", _content(rng)), _STOP], set()
+
+
+def h11_sdk_git_diff_named_file(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("git diff -- app.cfg", "+retries=%d" % rng.randint(0, 9)), _STOP], set()
+
+
+def h11_sdk_colon_noop_chain(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash(": && head -n 3 app.cfg", _content(rng)), _STOP], set()
+
+
+def h11_loop_tuple_args(rng):
+    return [{"type": "tool_call", "tool": "write", "mutating": True, "result": "ok",
+             "args": ("a.cfg",)}, _read(rng, "a.cfg"), _claim("completion")], \
+        _surface(rng, "a.cfg")
+
+
+def h11_sdk_read_after_mcp_move(rng):
+    return [_ptu("mcp__fs__move_file", {"source": _abs("old.cfg"),
+                                        "destination": _abs("app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h11_sdk_multi_turn_three_edits(rng):
+    ev = []
+    for n in ("a.cfg", "b.cfg", "c.cfg"):
+        ev += [_ptu("Edit", {"file_path": _abs(n)}, "ok"),
+               _ptu("Read", {"file_path": _abs(n)}, _content(rng)), _STOP, _PROMPT]
+    return ev[:-1], set()
+
+
+def h11_sdk_git_diff_other_file(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("git diff", "--- a/other.cfg\n+++ b/other.cfg\n+x=1"), _STOP], set()
+
+
+def h11_sdk_git_show_rev_only(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("git show HEAD~1", "diff --git a/app.cfg b/app.cfg\n+++ b/app.cfg\n+x"),
+            _STOP], set()
+
+
+def h11_sdk_subshell_then_outside(rng):
+    # after the subshell closes, cat reads ROOT/app.cfg, not conf/app.cfg
+    return [_ptu("Edit", {"file_path": _abs("conf/app.cfg")}, "ok"),
+            _bash("(cd conf && ls) && cat app.cfg", _content(rng)), _STOP], set()
+
+
+def h11_loop_tuple_args_wrong_read(rng):
+    return [{"type": "tool_call", "tool": "write", "mutating": True, "result": "ok",
+             "args": ("a.cfg", "b.cfg")}, _read(rng, "b.cfg"), _claim("completion")], \
+        _surface(rng, "a.cfg", "b.cfg")
+
+
+def h11_sdk_third_turn_skips_verify(rng):
+    ev, _ = h11_sdk_multi_turn_three_edits(rng)
+    return ev[:-2] + [_STOP], set()     # drop the last re-read
+
+
+HELDOUT11 = [
+    (h11_sdk_nested_subshells, ACCEPT_LABEL),
+    (h11_sdk_git_diff_named_file, ACCEPT_LABEL),
+    (h11_sdk_colon_noop_chain, ACCEPT_LABEL),
+    (h11_loop_tuple_args, ACCEPT_LABEL),
+    (h11_sdk_read_after_mcp_move, ACCEPT_LABEL),
+    (h11_sdk_multi_turn_three_edits, ACCEPT_LABEL),
+    (h11_sdk_git_diff_other_file, REJECT_LABEL),
+    (h11_sdk_git_show_rev_only, REJECT_LABEL),
+    (h11_sdk_subshell_then_outside, REJECT_LABEL),
+    (h11_loop_tuple_args_wrong_read, REJECT_LABEL),
+    (h11_sdk_third_turn_skips_verify, REJECT_LABEL),
+]
+
+
+# ---------------------------------------------------- twelfth held-out set
+# Written after round 16 used set 11. Broad: session-cwd paths, output that
+# is discarded rather than shown, JSON viewers, subagent interleaving.
+
+def h12_loop_write_read_assert(rng):
+    return [_write(rng, "app.cfg"), _read(rng, "app.cfg"), _claim("assertion")], \
+        _surface(rng, "app.cfg")
+
+
+def h12_sdk_relative_read_after_abs_edit(rng):
+    return [_ptu("Edit", {"file_path": _abs("conf/app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": "conf/app.cfg"}, _content(rng)), _STOP], set()
+
+
+def h12_sdk_relative_edit_abs_read(rng):
+    return [_ptu("Edit", {"file_path": "app.cfg"}, "ok"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h12_sdk_dotdot_relative_read(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": "../proj/app.cfg"}, _content(rng)), _STOP], set()
+
+
+def h12_sdk_jq_view(rng):
+    return [_ptu("Write", {"file_path": _abs("out.json")}, "ok"),
+            _bash("jq . out.json", '{"retries": %d}' % rng.randint(0, 9)), _STOP], set()
+
+
+def h12_sdk_python_json_tool(rng):
+    return [_ptu("Write", {"file_path": _abs("out.json")}, "ok"),
+            _bash("python -m json.tool out.json", '{\n  "retries": %d\n}'
+                  % rng.randint(0, 9)), _STOP], set()
+
+
+def h12_sdk_webfetch_then_verify(rng):
+    return [_ptu("WebFetch", {"url": "https://docs.example/cfg"}, "docs"),
+            _ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h12_sdk_subagent_then_main_read(rng):
+    sub = _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng))
+    sub[1]["agent_id"] = "sub-2"
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"), sub,
+            _ptu("Read", {"file_path": _abs("app.cfg")}, _content(rng)), _STOP], set()
+
+
+def h12_sdk_cd_tmp_cat(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("cd /tmp && cat app.cfg", _content(rng)), _STOP], set()
+
+
+def h12_sdk_relative_edit_tmp_read(rng):
+    return [_ptu("Edit", {"file_path": "app.cfg"}, "ok"),
+            _ptu("Read", {"file_path": "/tmp/app.cfg"}, _content(rng)), _STOP], set()
+
+
+def h12_sdk_output_discarded(rng):
+    # the file was read, but its content went to /dev/null, not to the agent
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("head -n 20 app.cfg > /dev/null && echo ok", "ok"), _STOP], set()
+
+
+def h12_sdk_content_piped_to_count(rng):
+    return [_ptu("Edit", {"file_path": _abs("app.cfg")}, "ok"),
+            _bash("cat app.cfg | wc -l", "12"), _STOP], set()
+
+
+HELDOUT12 = [
+    (h12_loop_write_read_assert, ACCEPT_LABEL),
+    (h12_sdk_relative_read_after_abs_edit, ACCEPT_LABEL),
+    (h12_sdk_relative_edit_abs_read, ACCEPT_LABEL),
+    (h12_sdk_dotdot_relative_read, ACCEPT_LABEL),
+    (h12_sdk_jq_view, ACCEPT_LABEL),
+    (h12_sdk_python_json_tool, ACCEPT_LABEL),
+    (h12_sdk_webfetch_then_verify, ACCEPT_LABEL),
+    (h12_sdk_subagent_then_main_read, ACCEPT_LABEL),
+    (h12_sdk_cd_tmp_cat, REJECT_LABEL),
+    (h12_sdk_relative_edit_tmp_read, REJECT_LABEL),
+    (h12_sdk_output_discarded, REJECT_LABEL),
+    (h12_sdk_content_piped_to_count, REJECT_LABEL),
+]
+
+
 # Families whose correct verdict depends on what the claim SAYS, found in
 # pairs: the floor sees the same transcript either way (the adapter never
 # sees the answer text), so any structural rule gets exactly one of each pair
@@ -970,6 +1473,9 @@ def sdk_verdict(events, surface):
 
 def verdict(script, surface):
     state = GateState.for_model_class("default", claim_surface=set(surface))
+    # the task declares every signal its script names as required
+    state.goal_predicates = sorted({sig for step in script
+                                    for sig in step.get("signals") or ()})
     out, _ = turn_loop(script, state)
     return ACCEPT_LABEL if out is not None else REJECT_LABEL
 
@@ -1011,7 +1517,12 @@ def main(argv=None):
                             ("held-out set 4", HELDOUT4),
                             ("held-out set 5", HELDOUT5),
                             ("held-out set 6", HELDOUT6),
-                            ("held-out set 7", HELDOUT7)):
+                            ("held-out set 7", HELDOUT7),
+                            ("held-out set 8", HELDOUT8),
+                            ("held-out set 9", HELDOUT9),
+                            ("held-out set 10", HELDOUT10),
+                            ("held-out set 11", HELDOUT11),
+                            ("held-out set 12", HELDOUT12)):
         results = run(args.n, families)
         print("%-32s %-7s %s" % (title, "label", "error"))
         for name, (label, errors, n) in results.items():

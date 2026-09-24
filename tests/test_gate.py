@@ -521,6 +521,11 @@ from grounding_gate.state import (  # noqa: E402
     surface_hits)
 
 
+def test_surface_hits_resolve_dotdot():
+    assert surface_hits({"/srv/proj/src/../app.cfg"}, {"/srv/proj/app.cfg"})
+    assert not surface_hits({"/srv/proj/src/app.cfg"}, {"/srv/proj/src/../app.cfg"})
+
+
 def test_surface_hits_match_path_spellings_but_not_other_dirs():
     for spelling in ("app.cfg", "./app.cfg", "proj/app.cfg", "/srv/proj/app.cfg"):
         assert surface_hits({spelling}, {"/srv/proj/app.cfg"}), spelling
@@ -592,10 +597,13 @@ def test_shell_write_targets():
 
 def test_shell_is_read_only():
     for cmd in ("cat app.cfg", "grep -rn x . | wc -l", "git diff HEAD",
-                "ls 2>/dev/null", "cat a 2>&1 | grep x"):
+                "ls 2>/dev/null", "cat a 2>&1 | grep x", "sed -n 1p a",
+                "sed -n '5,9p' a", "awk 'NR<=20' a"):
         assert shell_is_read_only(cmd), cmd
     for cmd in ("cat a > b", "cat a | tee b", "echo $(rm x)", "git push",
-                "sed -n 1p a", "FOO=1 cat a", "cat a & rm b", "rm -rf x", ""):
+                "sed s/a/b/ a", "sed -n 1w out a", "sed -i -n 1p a",
+                "awk '{system(\"rm x\")}' a", "FOO=1 cat a", "cat a & rm b",
+                "rm -rf x", ""):
         assert not shell_is_read_only(cmd), cmd
 
 
@@ -606,6 +614,40 @@ def test_shell_read_operands():
     assert shell_read_operands("ls -l app.cfg") == (set(), {"app.cfg"})
     assert shell_read_operands("echo app.cfg") == (set(), set())
     assert shell_read_operands("git diff app.cfg")[0] == {"app.cfg"}
+
+
+def test_shell_cd_and_subshells_resolve_operands():
+    assert shell_read_operands("cd conf && cat app.cfg")[0] == {"conf/app.cfg"}
+    assert shell_read_operands("(cd conf && ls) && cat app.cfg")[0] == {"app.cfg"}
+    assert shell_read_operands("(cd a && (cd b && cat x.cfg))")[0] == {"a/b/x.cfg"}
+    assert shell_read_operands("cd - && cat app.cfg")[0] == set()   # unknown dir
+    assert shell_read_operands("cat app.cfg", cwd="/srv/p")[0] == {"/srv/p/app.cfg"}
+    assert shell_write_targets("cd conf && sed -i s/a/b/ app.cfg") == {"conf/app.cfg"}
+    assert shell_is_read_only("(cd conf && cat app.cfg)")
+    assert shell_is_read_only("grep -n x app.cfg || true")
+
+
+def test_shell_git_revisions_and_diff_headers():
+    assert shell_read_operands("git show HEAD:app.cfg")[0] == set()
+    assert shell_read_operands("git diff", "+++ b/app.cfg\n+x")[0] == {"app.cfg"}
+
+
+def test_shell_content_must_reach_the_agent():
+    assert shell_read_operands("cat app.cfg | wc -l") == (set(), {"app.cfg"})
+    assert shell_read_operands("head app.cfg > /dev/null")[0] == set()
+    assert shell_read_operands("cat app.cfg 2>/dev/null")[0] == {"app.cfg"}
+    assert shell_read_operands("grep -q x app.cfg")[0] == set()
+    assert shell_read_operands("cat app.cfg | grep x")[0] == {"app.cfg"}
+
+
+def test_json_tool_is_a_viewer_only_without_an_output_file():
+    assert shell_read_operands("python3 -m json.tool out.json")[0] == {"out.json"}
+    assert not shell_is_read_only("python -m json.tool in.json out.json")
+    assert not shell_is_read_only("python -c 'print(1)'")
+
+
+def test_list_args_mutation_targets():
+    assert mutation_targets(["a.cfg", "b.cfg"], {"a.cfg", "b.cfg"}) == {"a.cfg", "b.cfg"}
 
 
 # ------------------------------------------------------- bare-python runner

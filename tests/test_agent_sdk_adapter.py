@@ -395,6 +395,39 @@ def test_deleted_scratch_file_is_not_owed():
         assert run(gate.stop(STOP, None, None)) == {}, rm
 
 
+def test_grep_file_list_cannot_verify_but_content_mode_can():
+    files = ptu("Grep", {"pattern": "x", "path": "/p"}, "/p/app.cfg")
+    assert _edit_then(files)["decision"] == "block"
+    lines = ptu("Grep", {"pattern": "x", "path": "/p", "output_mode": "content"},
+                "/p/app.cfg:3:x=1")
+    assert _edit_then(lines) == {}
+
+
+def test_mcp_filesystem_tools_are_classified():
+    read = ptu("mcp__fs__read_text_file", {"path": "/p/app.cfg"}, "x=1")
+    assert _edit_then(read) == {}
+    listing = ptu("mcp__fs__list_directory", {"path": "/p"}, "[FILE] app.cfg")
+    assert _edit_then(listing)["decision"] == "block"
+    gate = GateHooks()
+    run(gate.post_tool_use(ptu("mcp__fs__write_file", {"path": "/p/a.cfg"}, "ok"),
+                           "t1", None))
+    assert gate.state.pending_verification == {"/p/a.cfg"}
+
+
+def test_relative_paths_resolve_against_session_cwd():
+    def event(tool, tool_input, out="ok"):
+        return dict(ptu(tool, tool_input, out), cwd="/srv/proj")
+    gate = GateHooks()
+    run(gate.post_tool_use(event("Edit", {"file_path": "/srv/proj/conf/app.cfg"}),
+                           "t1", None))
+    # from /srv/proj, a bare app.cfg is /srv/proj/app.cfg, not conf/app.cfg
+    run(gate.post_tool_use(event("Bash", {"command": "cat app.cfg"}, "x=1"), "t2", None))
+    assert run(gate.stop(STOP, None, None))["decision"] == "block"
+    run(gate.post_tool_use(event("Read", {"file_path": "conf/app.cfg"}, "x=2"),
+                           "t3", None))
+    assert run(gate.stop(STOP, None, None)) == {}
+
+
 # ------------------------------------------------------- bare-python runner
 
 if __name__ == "__main__":
