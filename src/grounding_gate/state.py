@@ -95,7 +95,7 @@ class GateState:
                 "budget meaningless" % (refill, cap))
         return cls(budget=cap, cap=cap, refill=refill, **kw)
 
-    def note_mutation(self, args, cwd="", output="", failed=False):
+    def note_mutation(self, args, cwd="", output="", failed=False, home=None):
         """Record a mutating call at ``current_step``.
 
         A completion now needs a fresh read AFTER this step, earlier
@@ -123,7 +123,7 @@ class GateState:
         if failed:
             return
         from . import shell
-        effs = shell.effects(command, cwd, output)
+        effs = shell.effects(command, cwd, output, home)
         if effs is None:
             return                     # unparseable: freshness still applies
         for eff in effs:
@@ -132,7 +132,8 @@ class GateState:
                 self.pending_verification.add(eff[1])
                 self.claim_surface.add(eff[1])
             elif kind == "remove":
-                for e in _removed({eff[1]}, self.pending_verification):
+                for e in _removed({eff[1]}, self.pending_verification, eff[2],
+                                  self.pending_aliases):
                     self._drop(e)
             elif kind == "move":
                 self._move(*eff[1:])
@@ -155,32 +156,39 @@ class GateState:
 
     def _owed_hits(self, idents):
         """Owed entries ``idents`` pay: the entry's path, or its alias."""
-        return {e for e in self.pending_verification
-                if surface_hits(idents, {e}) or (
-                    e in self.pending_aliases
-                    and surface_hits(idents, {self.pending_aliases[e]}))}
+        hits = surface_hits(idents, self.pending_verification)
+        by_alias = {a: e for e, a in self.pending_aliases.items()
+                    if e in self.pending_verification}
+        hits |= {by_alias[a] for a in surface_hits(idents, set(by_alias))}
+        return hits
 
     def _move(self, src, dst, alt):
         """Carry debt from ``src`` (a file, or a directory holding owed
         files) to ``dst``. ``alt`` is the other reading of an ambiguous
-        ``mv a b``: b may be an existing directory, so b/a also pays."""
+        ``mv a b``: b may be an existing directory, so b/a also pays. An
+        entry is found by its own path or by its alias, so a file moved
+        into a directory can be moved again."""
+        inside = "/" + _canonical(src).rstrip("/") + "/"
         for e in list(self.pending_verification):
-            ce = "/" + _canonical(e)
-            inside = "/" + _canonical(src).rstrip("/") + "/"
-            if surface_hits({src}, {e}):
-                new, alias = dst, alt
-            elif inside in ce:
-                rest = ce[ce.index(inside) + len(inside):]
-                new = posixpath.join(dst, rest)
-                alias = posixpath.join(alt, rest) if alt else None
-            else:
-                continue
-            self._drop(e)
-            self.pending_verification.add(new)
-            self.claim_surface.add(new)
-            if alias:
-                self.pending_aliases[new] = alias
-                self.claim_surface.add(alias)
+            for candidate in (e, self.pending_aliases.get(e)):
+                if not candidate:
+                    continue
+                ce = "/" + _canonical(candidate)
+                if surface_hits({src}, {candidate}):
+                    new, alias = dst, alt
+                elif inside in ce:
+                    rest = ce[ce.index(inside) + len(inside):]
+                    new = posixpath.join(dst, rest)
+                    alias = posixpath.join(alt, rest) if alt else None
+                else:
+                    continue
+                self._drop(e)
+                self.pending_verification.add(new)
+                self.claim_surface.add(new)
+                if alias:
+                    self.pending_aliases[new] = alias
+                    self.claim_surface.add(alias)
+                break
 
     def observation_identifiers(self, tool_name, args, result):
         """Identifiers one tool call touched (per-tool extractor or default).
@@ -361,19 +369,24 @@ def surface_hits(idents, surface):
     """
     symbols = {str(i) for i in idents if isinstance(i, Symbol)}
     idents = {_canonical(i) for i in idents if not isinstance(i, Symbol)}
+    # every trailing part of every LOCAL path identifier, computed once so a
+    # large surface against a large output stays linear ("//host/app.cfg",
+    # from a URL, names a remote file and contributes no tails)
+    tails = set()
+    for i in idents:
+        if "/" in i and not i.startswith("//"):
+            parts = i.split("/")
+            tails.update("/".join(parts[k:]) for k in range(1, len(parts)))
     hits = set()
     for entry in surface:
         s = _canonical(entry)
-        if s in idents or ("/" not in entry and entry in symbols):
+        if s in idents or s in tails or ("/" not in entry and entry in symbols):
             hits.add(entry)
             continue
         # an identifier that is a tail of the surface path ("app.cfg" for
-        # "/srv/proj/app.cfg"), or a longer LOCAL path ending in the surface
-        # entry ("//host/app.cfg", from a URL, names a remote file)
+        # "/srv/proj/app.cfg")
         parts = s.split("/")
-        if any("/".join(parts[k:]) in idents for k in range(1, len(parts))) or \
-                any(i.endswith("/" + s) for i in idents
-                    if "/" in i and not i.startswith("//")):   # not a URL
+        if any("/".join(parts[k:]) in idents for k in range(1, len(parts))):
             hits.add(entry)
     return hits
 
@@ -442,19 +455,40 @@ def _under(cwd, path):
     return path if path.startswith("/") or not cwd else posixpath.join(cwd, path)
 
 
-def _removed(operands, pending):
+def _removed(operands, pending, recursive=True, aliases=None):
     """The owed entries an ``rm`` of ``operands`` deleted: the files
     themselves (path matching as in ``surface_hits``), entries under a
-    removed directory, and glob matches on each entry's trailing components
-    (``tmp*.txt`` removes ``/srv/proj/tmp1.txt``)."""
+    removed directory when ``recursive``, and glob matches. A glob is
+    matched component by component (``tmp/*.txt`` never reaches into
+    ``tmp/sub/``, but ``rm -r tmp/*`` removes what is under ``tmp/sub``).
+    An entry also counts as removed when its alias path is."""
+    aliases = aliases or {}
     hits = set()
-    for operand in operands:
-        if set(operand) & set("*?["):
-            depth = operand.count("/") + 1
-            hits |= {e for e in pending if fnmatch.fnmatchcase(
-                "/".join(_canonical(e).split("/")[-depth:]), _canonical(operand))}
-            continue
-        hits |= surface_hits({operand}, pending)
-        inside = "/" + _canonical(operand).rstrip("/") + "/"
-        hits |= {e for e in pending if inside in "/" + _canonical(e)}
+    for entry in pending:
+        for candidate in (entry, aliases.get(entry)):
+            if candidate and _removes_path(operands, candidate, recursive):
+                hits.add(entry)
+                break
     return hits
+
+
+def _removes_path(operands, path, recursive):
+    cpath = _canonical(path)
+    for operand in operands:
+        op = _canonical(operand).rstrip("/") or "/"
+        if set(op) & set("*?["):
+            parts = cpath.strip("/").split("/")
+            depth = op.strip("/").count("/") + 1
+            if op.startswith("/") and cpath.startswith("/"):
+                if len(parts) >= depth and fnmatch.fnmatchcase(
+                        "/" + "/".join(parts[:depth]), op) and (
+                        len(parts) == depth or recursive):
+                    return True
+            elif fnmatch.fnmatchcase("/".join(parts[-depth:]), op.lstrip("/")):
+                return True
+            continue
+        if surface_hits({operand}, {path}):
+            return True
+        if recursive and ("/" + op.strip("/") + "/") in ("/" + cpath):
+            return True
+    return False

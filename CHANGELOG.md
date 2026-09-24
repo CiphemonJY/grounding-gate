@@ -64,6 +64,28 @@
     `WebSearch` never verify a change; `Grep` is relevant only to files whose
     lines it printed; owed re-reads and the completion claim are per turn;
     a missing `tool_name` no longer crashes.
+- Second independent review, of the new parser (23 findings, all
+  reproduced, all pinned in `tests/test_review_findings.py`). The rule is
+  now to fail toward "unknown", never toward a guess:
+  - In-place edits hidden in flag bundles (`sed -ni`, `sed -Ei`, `sort -uo`,
+    `awk -i inplace`, `tree -o`) and substitutions in assignment-only
+    stages (`x=$(sed -i ...)`) count as writes.
+  - Option values are never taken for a pattern or a file (`grep -A 3`,
+    `grep -e PAT`); `path:` prefixes and diff headers credit a file only when
+    one stage produced the whole output and the path lies under what it
+    searched; git's index and other commits (`--cached`, `A..B`, `git grep
+    REV`, `git show`) never verify the working tree; a repo-root diff
+    header can't pay for a same-named file elsewhere.
+  - `~` resolves to the real home directory (`GateHooks(home=...)` to
+    override); `pushd`/`popd`, background `cd x &`, `cd -P`, `if`/`then`
+    keywords, ANSI-C quotes, `((...))` arithmetic and quoted heredoc
+    delimiters are handled; `git rm --cached`/`-n` remove nothing.
+  - Devices, process substitutions and closed descriptors are never owed;
+    BSD `sed -i .bak`, directory renames (`mv src/ lib/`), moving a file
+    that was already moved, and `rm -rf dir/*` are followed.
+  - The `sed` script matcher no longer backtracks (an 11 s input now takes
+    under 1 ms); path matching is linear in the output size; a `tool_name`
+    of any type no longer crashes.
 - CI tests every supported Python (3.9-3.13), builds the sdist/wheel with
   `twine check`, and imports the installed wheel with no extras. The release
   workflow refuses a tag that doesn't match the package version.

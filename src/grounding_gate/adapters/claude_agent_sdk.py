@@ -56,6 +56,7 @@ callables themselves are plain async functions you can also register by hand.
 """
 
 import json
+import os
 import posixpath
 import re
 
@@ -211,17 +212,28 @@ def _remote_identifiers(args, result):
     return _symbols(_output_text(result))
 
 
-def _grep_identifiers(args, result):
+def _grep_identifiers(args, result, cwd=""):
     """Relevance for the Grep tool: files whose lines it printed (the
     ``path:`` prefixes of content output, or the searched path when it is
     one file and lines carry no prefix), plus symbols in the matched text.
     A file named inside a pattern or a matched line was not searched."""
     decoded = _decode(args)
     searched = decoded.get("path") if isinstance(decoded, dict) else None
+    searched = searched if isinstance(searched, str) and searched else None
     text = _output_text(result)
-    prefixed = set(shell._OUTPUT_PATH.findall(text))
-    paths = prefixed or ({searched} if isinstance(searched, str) and text.strip()
-                         else set())
+    # a prefix names a file only if it is path-like and, placed against the
+    # session cwd, lies INSIDE what was searched. A single-file search
+    # prints bare lines, so "a.cfg: ..." there is matched text (it can't be
+    # inside /p/CHANGELOG), and "12:" is a line number.
+    base = shell.resolve(searched or ".", cwd) or ""
+    prefixed = set()
+    for p in shell._OUTPUT_PATH.findall(text):
+        placed = shell.resolve(p, cwd)
+        if ("/" in p or "." in p) and placed and (
+                base in ("", ".") and not placed.startswith("/")
+                or placed.startswith(base.rstrip("/") + "/")):
+            prefixed.add(placed)
+    paths = prefixed or ({searched} if searched and text.strip() else set())
     return paths | _symbols(text)
 
 
@@ -236,7 +248,7 @@ def _absolutize(tool_input, cwd):
             for k, v in tool_input.items()}
 
 
-def _shell_identifiers(args, result, cwd=""):
+def _shell_identifiers(args, result, cwd="", home=None):
     """Relevance for a read-only shell call: the files it operates on (and
     the ``path:`` prefixes a multi-file search prints), never a grep pattern
     or an echo argument. Only consulted for shell reads: a mutating call
@@ -246,7 +258,7 @@ def _shell_identifiers(args, result, cwd=""):
     if not isinstance(command, str):
         return extract_identifiers(args, result)
     text = _output_text(result)
-    content, listed = shell.read_operands(command, text, cwd)
+    content, listed = shell.read_operands(command, text, cwd, home)
     # output is file content only when a content program ran (not for a
     # bare `echo load_settings`)
     return content | listed | (_symbols(text) if content else set())
@@ -321,13 +333,13 @@ class GateHooks:
                  remote_tools=DEFAULT_REMOTE_TOOLS,
                  max_blocks=3, gate_subagents=False,
                  normalizers=None, extractors=None,
-                 verifier=None, emit_progress=False):
+                 verifier=None, emit_progress=False, home=None):
         extractors = dict(extractors or {})
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
         for tool in remote_tools:
             extractors.setdefault(tool, _remote_identifiers)
-        extractors.setdefault("Grep", _grep_identifiers)
+        extractors.setdefault("Grep", self._grep_extract)
         for tool in mutating_tools:
             extractors.setdefault(tool, self._shell_extract)
         self.state = GateState.for_model_class(
@@ -349,6 +361,9 @@ class GateHooks:
         self._blocks = 0
         self._tool_calls_this_turn = 0
         self._cwd = ""   # session working directory, from hook inputs
+        # the agent's home directory, for `~/x` in shell commands (the SDK
+        # runs the agent on this machine, as this user)
+        self._home = home if home is not None else os.path.expanduser("~")
         self._mutated_this_turn = False
 
     # ------------------------------------------------------------ hooks
@@ -359,7 +374,8 @@ class GateHooks:
             return {}
         if input_data.get("agent_id") and not self.gate_subagents:
             return {}
-        tool = input_data.get("tool_name") or ""
+        tool = input_data.get("tool_name")
+        tool = tool if isinstance(tool, str) else ""
         self._note_cwd(input_data)
         tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
         output = _output_text(input_data.get("tool_response", ""))
@@ -383,7 +399,8 @@ class GateHooks:
         if shell_read:
             # only files whose content reached the agent can verify; files
             # it merely listed or counted cannot
-            shown = shell.read_operands(tool_input["command"], output, self._cwd)[0]
+            shown = shell.read_operands(tool_input["command"], output, self._cwd,
+                                        self._home)[0]
             if not surface_hits(shown, self.state.claim_surface):
                 obs["grounds_completion"] = False
         if (tool in self.listing_tools or tool in self.remote_tools
@@ -423,7 +440,8 @@ class GateHooks:
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
         self._note_cwd(input_data)
-        tool = input_data.get("tool_name") or ""
+        tool = input_data.get("tool_name")
+        tool = tool if isinstance(tool, str) else ""
         tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
         if ((tool in self.mutating_tools and not self._is_shell_read(tool, tool_input))
                 or _mcp_class(tool) == "mutating"):
@@ -533,7 +551,7 @@ class GateHooks:
         records no mutation."""
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         return (tool in self.mutating_tools and isinstance(command, str)
-                and shell.is_read_only(command))
+                and shell.is_read_only(command, self._home))
 
     def _note_cwd(self, input_data):
         """Track the session's working directory (every SDK hook input
@@ -542,15 +560,18 @@ class GateHooks:
         if isinstance(cwd, str) and cwd.startswith("/"):
             self._cwd = cwd
 
+    def _grep_extract(self, args, result):
+        return _grep_identifiers(args, result, self._cwd)
+
     def _shell_extract(self, args, result):
-        return _shell_identifiers(args, result, self._cwd)
+        return _shell_identifiers(args, result, self._cwd, self._home)
 
     def _record_mutation(self, tool_input, output="", failed=False):
         # a NEW mutation invalidates any earlier verification, its targets are
         # owed a re-read, and mutated identifiers join the claim surface so
         # only reads of THOSE count as verification
         self._mutated_this_turn = True
-        self.state.note_mutation(tool_input, self._cwd, output, failed)
+        self.state.note_mutation(tool_input, self._cwd, output, failed, self._home)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier

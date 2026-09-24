@@ -296,7 +296,9 @@ of a pipeline must pass lines through (`cat app.cfg | grep x` shows content;
 `sed` and `awk` count as reads when they can only print (`sed -n '1,40p'`,
 `awk 'NR<=20'`), as does `python -m json.tool FILE`. `cd` inside a command,
 subshells and the session's working directory (the hook's `cwd`) are
-followed, so `cd conf && cat app.cfg` reads `conf/app.cfg`. `git show
+followed, so `cd conf && cat app.cfg` reads `conf/app.cfg`, and `~/x`
+resolves to the agent's home directory (`GateHooks(home=...)` if the agent
+runs as another user). `git show
 HEAD:app.cfg` is the committed copy, not the edit; a bare `git diff` counts
 for the files in its `+++ b/` headers. `Grep` in its default
 `files_with_matches` (or `count`) mode is a listing. The reference MCP

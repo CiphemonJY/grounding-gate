@@ -36,8 +36,8 @@ def ptu(tool, tool_input, response="ok", cwd="/p"):
             "tool_input": tool_input, "tool_response": response, "cwd": cwd}
 
 
-def go(*steps, cwd="/p", surface=()):
-    gate = GateHooks(claim_surface=set(surface))
+def go(*steps, cwd="/p", surface=(), home="/home/u"):
+    gate = GateHooks(claim_surface=set(surface), home=home)
     for step in steps:
         drive(gate.post_tool_use(ptu(*step, cwd=cwd), None, None))
     out = drive(gate.stop(STOP, None, None))
@@ -163,6 +163,140 @@ def test_traps_are_accepted():
 def test_cwd_and_home_cases():
     for name, (want, steps) in HOME_TRAPS.items():
         assert go(*steps, cwd=H)[0] == want, name
+
+
+# ------------------------------------------------ second review round
+# Written against the new shell parser; same rules (reviewer's verdicts).
+
+LEAKS_2 = {
+    "sed -ni edits in place": (edit("/p/a.cfg"), bash("sed -ni '/keep/p' a.cfg", "")),
+    "sed -Ei edits in place": (edit("/p/b.cfg"), bash("sed -Ei 's/30/60/' a.cfg"),
+                               read("/p/b.cfg")),
+    "sort -uo rewrites the file": (edit("/p/a.cfg"), bash("sort -uo a.cfg a.cfg", "")),
+    "pipe into sort -o": (edit("/p/a.cfg"), bash("grep -v '^#' a.cfg | sort -o a.cfg", "")),
+    "awk -i inplace": (edit("/p/a.cfg"), bash("awk -i inplace '{sub(/30/,\"60\")}1' a.cfg", "")),
+    "awk -v with a redirecting program": (
+        edit("/p/a.cfg"), read("/p/a.cfg"), bash("awk -v n=1 '{print > \"a.cfg\"}' x", "")),
+    "assignment-only substitution": (
+        edit("/p/a.cfg"), read("/p/a.cfg"),
+        bash("out=$(sed -i 's/30/60/' a.cfg); echo done", "done")),
+    "grep -e: the pattern is not a file": (
+        edit("/p/a.cfg"), bash("grep -e a.cfg CHANGELOG", "bumped a.cfg")),
+    "grep -A 3: the option value is not the pattern": (
+        edit("/p/app.cfg"),
+        bash("grep -n -A 3 app.cfg CHANGELOG.md", "12:bumped the timeout in app.cfg")),
+    "another stage's output is not grep's": (
+        edit("/p/a.cfg"), bash_dict("cat CHANGELOG; grep -rn foo src",
+                                    "a.cfg: raised timeout\nsrc/x.py:1:foo")),
+    "flake8 output is not grep's": (
+        edit("/p/src/a.py"), bash_dict("flake8 src; grep -rn TODO docs",
+                                       "src/a.py:3:1: E302 ...\ndocs/x.md:1:TODO")),
+    "rg reading a pipe prints no file names": (
+        edit("/p/a.cfg"), bash_dict("git log --format=%s | rg timeout", "a.cfg: raise timeout")),
+    "git diff --cached shows the index": (
+        edit("/p/a.cfg"), bash("git add a.cfg"), edit("/p/a.cfg"),
+        bash("git diff --cached", "+++ b/a.cfg\n+t=1")),
+    "git diff between two commits": (
+        edit("/p/a.cfg"), bash("git diff HEAD~2 HEAD~1 -- a.cfg", "+++ b/a.cfg\n+t=1")),
+    "git grep at a revision": (
+        edit("/p/a.cfg"), bash("git grep timeout HEAD -- a.cfg", "HEAD:a.cfg:t=1")),
+    "git show headers credit nothing": (
+        edit("/p/a.cfg"), bash("git show HEAD -- a.cfg; git diff b.cfg",
+                               "+++ b/a.cfg\n+t=1\n+++ b/b.cfg\n+x")),
+    "a repo-root diff header is not web/package.json": (
+        edit("/p/package.json"), edit("/p/web/package.json"),
+        bash("git diff package.json", "--- a/package.json\n+++ b/package.json\n+x")),
+    "git rm --cached keeps the file": (
+        edit("/p/a.cfg"), edit("/p/b.cfg"), bash("git rm --cached a.cfg"), read("/p/b.cfg")),
+    "git rm -n is a dry run": (
+        edit("/p/a.cfg"), edit("/p/b.cfg"), bash("git rm -n a.cfg"), read("/p/b.cfg")),
+    "pushd changes where sed ran": (
+        bash("pushd web && sed -i 's/1.0/1.1/' package.json && popd"),
+        read("/p/package.json", "{}")),
+    "Grep tool: matched text in a single-file search": (
+        edit("/p/a.cfg"),
+        ("Grep", {"pattern": "timeout", "path": "/p/CHANGELOG", "output_mode": "content"},
+         {"mode": "content", "content": "a.cfg: raised timeout"})),
+    "an earlier stage's /dev/null": (edit("/p/a.cfg"), bash("cat a.cfg >/dev/null | grep x", "")),
+    "tree -o writes a file": (edit("/p/a.cfg"), read("/p/a.cfg"), bash("tree -o a.cfg", "")),
+    "ANSI-C quotes don't hide a later sed": (
+        edit("/p/a.cfg"), read("/p/a.cfg"),
+        bash("echo $'\\'\\'' ; sed -i s/x/y/ a.cfg ; echo \\'", "")),
+    "arithmetic << is not a heredoc": (
+        edit("/p/a.cfg"), read("/p/a.cfg"), bash("(( head = 1 << 4 ))\nsed -i s/x/y/ a.cfg", "")),
+    "a quoted heredoc delimiter with a space": (
+        edit("/p/a.cfg"), read("/p/a.cfg"),
+        bash("cat <<'END X'\nhi\nEND X\nsed -i s/x/y/ a.cfg", "hi")),
+    "if/then doesn't hide sed -i": (
+        edit("/p/b.cfg"), bash("if true; then sed -i 's/a/b/' a.cfg; fi"), read("/p/b.cfg")),
+    "a background cd changes nothing": (
+        edit("/p/sub/a.cfg"), read("/p/sub/a.cfg"), bash("cd sub & sed -i s/x/y/ a.cfg"),
+        read("/p/sub/a.cfg", "y")),
+}
+
+TRAPS_2 = {
+    "writes to /dev/stderr are never owed": (
+        bash("echo 'patching' > /dev/stderr; sed -i 's/30/60/' a.cfg"),
+        bash("cat a.cfg", "t=60")),
+    "tee /dev/stderr": (bash("echo t=60 | tee /dev/stderr > a.cfg"), bash("cat a.cfg", "t=60")),
+    "process substitution target": (
+        bash("sed -i s/30/60/ a.cfg > >(tee sed.log)"), bash("cat a.cfg", "t=60")),
+    "BSD sed -i .bak": (bash("sed -i .bak 's/30/60/' a.cfg"), bash("cat a.cfg", "t=60")),
+    "mv into a directory, then rename there": (
+        edit("/p/a.cfg"), bash("mv a.cfg archive && mv archive/a.cfg archive/a-2024.cfg"),
+        read("/p/archive/a-2024.cfg")),
+    "mv src/ lib/ renames a directory": (
+        edit("/p/src/a.py"), bash("mv src/ lib/"), read("/p/lib/a.py")),
+    "rm -rf tmp/* removes nested files": (
+        edit("/p/tmp/sub/x.txt"), edit("/p/b.cfg"), bash("rm -rf tmp/*"), read("/p/b.cfg", "b=1")),
+    "cat < file": (edit("/p/a.cfg"), bash("cat < a.cfg", "t=1")),
+    "awk comparison is not a redirect": (edit("/p/a.cfg"), bash("awk 'NR>=1 && NR<=40' a.cfg", "t=1")),
+    "cd -P": (edit("/p/sub/a.cfg"), bash("cd -P sub && cat a.cfg", "t=1")),
+    "Grep tool single file with -n": (
+        edit("/p/a.cfg"),
+        ("Grep", {"pattern": "t", "path": "/p/a.cfg", "output_mode": "content", "-n": True},
+         {"mode": "content", "content": "1:t=1"})),
+    "git diff --no-prefix": (edit("/p/a.cfg"), bash("git diff --no-prefix a.cfg", "+++ a.cfg\n+t=1")),
+    "diff header with a space": (
+        edit("/p/my notes.txt"), bash_dict("git diff", "+++ b/my notes.txt\n+x")),
+    "closing stdout": (bash("sed -i s/1/2/ a.cfg >&-"), bash("cat a.cfg", "t=2")),
+}
+
+
+def test_round2_leaks_are_rejected():
+    for name, steps in LEAKS_2.items():
+        assert go(*steps)[0] == "REJECT", name
+
+
+def test_round2_traps_are_accepted():
+    for name, steps in TRAPS_2.items():
+        assert go(*steps) == ("ACCEPT", []), name
+
+
+def test_round2_home_is_the_real_home():
+    # ~/.gitignore is the global one, not the project's .gitignore
+    assert go(bash("echo '*.log' >> ~/.gitignore"), bash("cat .gitignore", "node_modules"),
+              home="/home/u")[0] == "REJECT"
+    assert go(bash("echo '*.log' >> ~/.gitignore"),
+              bash("cat ~/.gitignore", "*.log"), home="/home/u") == ("ACCEPT", [])
+
+
+def test_round2_hooks_survive_any_tool_name():
+    for name in (5, ["Bash"], {"x": 1}, None):
+        event = {"hook_event_name": "PostToolUse", "tool_name": name, "tool_input": {},
+                 "tool_response": "", "cwd": "/p"}
+        assert drive(GateHooks().post_tool_use(event, None, None)) == {}
+        event["hook_event_name"] = "PostToolUseFailure"
+        assert drive(GateHooks().post_tool_use_failure(event, None, None)) == {}
+
+
+def test_round2_pathological_input_is_fast():
+    import time
+    from grounding_gate import shell
+    start = time.perf_counter()
+    shell.effects("sed -n '" + " " * 1900 + "q' a.cfg", "/p", "")
+    shell.is_read_only("echo " + "$(" * 900)
+    assert time.perf_counter() - start < 0.5
 
 
 def test_T8_git_diff_headers_are_repo_relative():
