@@ -51,8 +51,10 @@ class GateState:
     rejection_count: int = 0
     # mutation targets not yet re-read since they were changed. A completion
     # verifies only once this is empty, so re-reading ONE of two edited files
-    # (or an unchanged neighbour) is not enough. Not reset per turn: an edit
-    # left unverified stays owed. See note_mutation / cover_pending.
+    # (or an unchanged neighbour) is not enough. The adapter resets it each
+    # user turn (an unverified turn was already reported via
+    # exited_unverified); moves and deletes transfer or clear entries, so an
+    # entry can always be paid. See note_mutation / cover_pending.
     pending_verification: set = field(default_factory=set)
     # per-turn latches
     grounded_this_turn: bool = False
@@ -103,9 +105,17 @@ class GateState:
         self.last_mutation_step = self.current_step
         self.verified_this_turn = False
         if isinstance(args, dict) and isinstance(args.get("command"), str):
-            # a deleted file can never be re-read: drop what it owed
+            # a deleted file (or a file under a deleted directory) can never
+            # be re-read: drop what it owed
             self.pending_verification -= _removed(
                 shell_remove_targets(args["command"], cwd), self.pending_verification)
+        for src, dst in move_pairs(args, cwd):
+            # a moved file's debt moves with it: re-read it at its new path
+            moved = _removed({src}, self.pending_verification)
+            if moved:
+                self.pending_verification -= moved
+                self.pending_verification.add(dst)
+                self.claim_surface.add(dst)
         self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
         self.claim_surface |= mutation_identifiers(args)
 
@@ -442,15 +452,60 @@ _HARMLESS_REDIRECTS = re.compile(r"\d?>\s*/dev/null|\d?>&\d")
 
 def _removed(operands, pending):
     """The owed entries an ``rm`` of ``operands`` deleted: path matches as in
-    ``surface_hits``, plus glob operands matched against each entry's
-    trailing components (``tmp*.txt`` removes ``/srv/proj/tmp1.txt``)."""
+    ``surface_hits``, entries under a removed directory, and glob operands
+    matched against each entry's trailing components (``tmp*.txt`` removes
+    ``/srv/proj/tmp1.txt``)."""
     hits = surface_hits(_identifiers_of(operands), pending)
+    for operand in operands:
+        # `rm -r build` removes everything owed under build/
+        inside = "/" + _canonical(operand).rstrip("/") + "/"
+        hits |= {e for e in pending if inside in "/" + _canonical(e)}
     for pattern in (o[2:] if o.startswith("./") else o for o in operands):
         if set(pattern) & set("*?["):
             depth = pattern.count("/") + 1
             hits |= {e for e in pending
                      if fnmatch.fnmatchcase("/".join(e.split("/")[-depth:]), pattern)}
     return hits
+
+
+def _under(cwd, path):
+    return path if path.startswith("/") or not cwd else posixpath.join(cwd, path)
+
+
+def move_pairs(args, cwd=""):
+    """``(source, destination)`` for each file a call moves: ``mv`` and
+    ``git mv`` in a shell command, or a structured ``source``/``destination``
+    call (the MCP filesystem server's ``move_file``). With several sources,
+    or a destination ending in ``/``, the destination is a directory."""
+    if not isinstance(args, dict):
+        return []
+    src, dst = args.get("source"), args.get("destination")
+    if isinstance(src, str) and isinstance(dst, str):
+        return [(_under(cwd, src), _under(cwd, dst))]
+    command = args.get("command")
+    if not isinstance(command, str):
+        return []
+    pairs = []
+    for _, argv, resolve, _ in _segments(command, cwd):
+        if not argv:
+            continue
+        if argv[0] == "mv":
+            operands = argv[1:]
+        elif argv[:2] == ["git", "mv"]:
+            operands = argv[2:]
+        else:
+            continue
+        operands = [o for o in operands
+                    if not o.startswith("-") and not set(o) & set("$`{*?")]
+        if len(operands) < 2:
+            continue
+        *sources, target = operands
+        into_dir = len(sources) > 1 or target.endswith("/")
+        for s in sources:
+            d = posixpath.join(target, posixpath.basename(s)) if into_dir else target
+            if resolve(s) and resolve(d):
+                pairs.append((resolve(s), resolve(d)))
+    return pairs
 
 
 def shell_remove_targets(command, cwd=""):

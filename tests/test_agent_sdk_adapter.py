@@ -428,6 +428,58 @@ def test_relative_paths_resolve_against_session_cwd():
     assert run(gate.stop(STOP, None, None)) == {}
 
 
+def _gate_after(*events):
+    gate = GateHooks()
+    for i, ev in enumerate(events):
+        if ev is PROMPT:
+            run(gate.user_prompt_submit(PROMPT, None, None))
+        else:
+            run(gate.post_tool_use(ev, "t%d" % i, None))
+    return gate, run(gate.stop(STOP, None, None))
+
+
+def test_moved_file_is_owed_at_its_new_path():
+    edit = ptu("Edit", {"file_path": "/p/a.cfg"}, "ok")
+    for move in (ptu("Bash", {"command": "mv /p/a.cfg /p/b.cfg"}, ""),
+                 ptu("Bash", {"command": "git mv /p/a.cfg /p/b.cfg"}, ""),
+                 ptu("mcp__fs__move_file",
+                     {"source": "/p/a.cfg", "destination": "/p/b.cfg"}, "ok")):
+        gate, out = _gate_after(edit, move)
+        assert out["decision"] == "block" and "/p/b.cfg" in out["reason"], move
+        gate, out = _gate_after(edit, move,
+                                ptu("Read", {"file_path": "/p/b.cfg"}, "x=1"))
+        assert out == {}, move
+
+
+def test_removed_directory_clears_what_it_owed():
+    gate, out = _gate_after(
+        ptu("Edit", {"file_path": "/p/build/x.cfg"}, "ok"),
+        ptu("Bash", {"command": "rm -rf /p/build"}, ""),
+        ptu("Edit", {"file_path": "/p/app.cfg"}, "ok"),
+        ptu("Read", {"file_path": "/p/app.cfg"}, "a=1"))
+    assert out == {}
+
+
+def test_owed_rereads_reset_each_turn():
+    gate, out = _gate_after(
+        ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"), PROMPT,
+        ptu("Edit", {"file_path": "/p/b.cfg"}, "ok"),
+        ptu("Read", {"file_path": "/p/b.cfg"}, "b=1"))
+    assert out == {}
+    gate, out = _gate_after(
+        ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"),
+        ptu("Read", {"file_path": "/p/a.cfg"}, "a=1"), PROMPT,
+        ptu("Edit", {"file_path": "/p/b.cfg"}, "ok"))
+    assert out["decision"] == "block"
+
+
+def test_block_reason_names_the_files_still_owed():
+    gate, out = _gate_after(ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"),
+                            ptu("Edit", {"file_path": "/p/b.cfg"}, "ok"),
+                            ptu("Read", {"file_path": "/p/a.cfg"}, "a=1"))
+    assert "/p/b.cfg" in out["reason"] and "/p/a.cfg" not in out["reason"]
+
+
 # ------------------------------------------------------- bare-python runner
 
 if __name__ == "__main__":

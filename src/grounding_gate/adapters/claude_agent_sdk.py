@@ -411,6 +411,10 @@ class GateHooks:
         self.state.verified_this_turn = False
         self.state.halted = False
         self.state.budget = self.state.cap   # fresh rope each turn
+        # owed re-reads are per turn: the last turn's unverified edits were
+        # already reported (exited_unverified); carrying them over would
+        # block every later turn over work the user has moved past
+        self.state.pending_verification = set()
         self.state.turn_observations = []    # per-turn; load-bearing (else a long
         #                                      session leaks retained observations).
         # last_verification_step is intentionally NOT reset — it is a monotonic
@@ -500,7 +504,12 @@ class GateHooks:
                 "re-ground with a stronger observation and finish again, or state "
                 "explicitly that your result is UNVERIFIED.")
         missing = []
-        if claim_type == "completion" and not self.state.verified_this_turn:
+        owed = sorted(self.state.pending_verification)
+        if claim_type == "completion" and owed:
+            missing.append(
+                "changed but not re-read since: " + ", ".join(owed) +
+                " (read each one after its last change)")
+        elif claim_type == "completion" and not self.state.verified_this_turn:
             missing.append(
                 "no verified-tier observation: re-read what you modified "
                 "(a fresh read of the changed files, AFTER the change)")
