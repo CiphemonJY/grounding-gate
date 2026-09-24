@@ -14,7 +14,7 @@ here are authored by the reviewer, never the generator):
        denied if it later becomes relevant.
 """
 
-from .state import extract_identifiers, normalize
+from .state import normalize, surface_hits
 
 
 def _normalized(state, tool_name, text):
@@ -46,12 +46,8 @@ def classify_observation(tool_name, args, result, state, read_only):
         if h in state.recent_result_hashes:
             return ret
 
-    extractor = state.extractors.get(tool_name, extract_identifiers)
-    ids = extractor(args, result)                                  # 2. RELEVANCE
-    # a bare string is ONE identifier — set("app.cfg") would explode it
-    # into characters and silently break relevance
-    idents = {ids} if isinstance(ids, str) else set(ids)
-    if not (idents & state.claim_surface):
+    idents = state.observation_identifiers(tool_name, args, result)  # 2. RELEVANCE
+    if not surface_hits(idents, state.claim_surface):
         return ret
 
     if h is not None:                                              # (C3)

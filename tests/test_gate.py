@@ -468,7 +468,8 @@ def test_progress_shape_zero_token():
         "budget", "cap", "refill", "budget_headroom", "step",
         "grounded_this_turn", "verified_this_turn", "rejection_count",
         "steps_since_last_mutation", "steps_since_last_verification",
-        "halted", "observations_this_turn", "unmet_signals"}
+        "halted", "observations_this_turn", "unmet_signals",
+        "pending_verification"}
     assert p1["budget"] == 6 and p1["cap"] == 6 and p1["budget_headroom"] == 0
     assert p1["steps_since_last_mutation"] is None       # never mutated
     assert p1["steps_since_last_verification"] is None   # never verified
@@ -511,6 +512,100 @@ def test_progress_after_mutate_verify_complete():
     assert p["verified_this_turn"] is True
     assert p["observations_this_turn"] >= 1
     assert p["steps_since_last_verification"] == 0   # verified at the current step
+
+
+# ------------------------------------------- paths, coverage, shell parsing
+
+from grounding_gate.state import (  # noqa: E402
+    mutation_targets, shell_is_read_only, shell_read_operands, shell_write_targets,
+    surface_hits)
+
+
+def test_surface_hits_match_path_spellings_but_not_other_dirs():
+    for spelling in ("app.cfg", "./app.cfg", "proj/app.cfg", "/srv/proj/app.cfg"):
+        assert surface_hits({spelling}, {"/srv/proj/app.cfg"}), spelling
+        assert surface_hits({spelling}, {"app.cfg"}), spelling
+    assert not surface_hits({"/etc/app.cfg"}, {"/srv/proj/app.cfg"})
+    assert not surface_hits({"app.cfg.bak"}, {"app.cfg"})
+    assert not surface_hits({"//example.com/app.cfg"}, {"app.cfg"})   # a URL
+
+
+def _tc(tool, args, result="ok", **kw):
+    return dict({"type": "tool_call", "tool": tool, "args": args, "result": result}, **kw)
+
+
+DONE = {"type": "terminal", "attempt": {"claim_type": "completion", "content": "done"}}
+
+
+def test_completion_needs_every_changed_file_reread():
+    st = GateState.for_model_class("default", claim_surface={"a.cfg", "b.cfg"})
+    out, _ = turn_loop([_tc("write", "a.cfg", mutating=True),
+                        _tc("write", "b.cfg", mutating=True),
+                        _tc("read", "a.cfg", "v=1"), DONE], st)
+    assert out is None and st.pending_verification == {"b.cfg"}
+    st = GateState.for_model_class("default", claim_surface={"a.cfg", "b.cfg"})
+    out, _ = turn_loop([_tc("write", "a.cfg", mutating=True),
+                        _tc("write", "b.cfg", mutating=True),
+                        _tc("read", "b.cfg", "v=2"), _tc("read", "a.cfg", "v=1"),
+                        DONE], st)
+    assert out == "done" and not st.pending_verification
+
+
+def test_rereading_an_unchanged_neighbour_is_not_verification():
+    st = GateState.for_model_class("default", claim_surface={"a.cfg", "b.cfg"})
+    out, _ = turn_loop([_tc("write", "b.cfg", mutating=True),
+                        _tc("read", "a.cfg", "v=1"), DONE], st)
+    assert out is None
+
+
+def test_failed_reread_cannot_verify():
+    st = S()
+    out, _ = turn_loop([_tc("write", "file.txt", mutating=True),
+                        _tc("read", "file.txt", "EACCES: file.txt", exit_ok=False),
+                        DONE], st)
+    assert out is None
+
+
+def test_turn_loop_verifies_undeclared_mutation_targets():
+    st = GateState.for_model_class("default")      # empty surface
+    out, _ = turn_loop([_tc("write", {"file_path": "/srv/app.cfg"}, mutating=True),
+                        _tc("read", "app.cfg", "v=1"), DONE], st)
+    assert out == "done" and "/srv/app.cfg" in st.claim_surface
+
+
+def test_mutation_targets_forms():
+    assert mutation_targets({"file_path": "/a/b.cfg", "content": "x"}, set()) == {"/a/b.cfg"}
+    assert mutation_targets("edit ./b.cfg now", {"b.cfg", "c.cfg"}) == {"b.cfg"}
+    assert mutation_targets({"command": "sed -i s/a/b/ x.cfg"}, set()) == {"x.cfg"}
+    assert mutation_targets({"command": "python fix.py"}, set()) == set()
+
+
+def test_shell_write_targets():
+    assert shell_write_targets("sed -i s/3/5/ a.cfg") == {"a.cfg"}
+    assert shell_write_targets("sed -i -e s/a/b/ a.cfg b.cfg") == {"a.cfg", "b.cfg"}
+    assert shell_write_targets("echo hi > out.txt && cat x") == {"out.txt"}
+    assert shell_write_targets("ls | tee -a log.txt") == {"log.txt"}
+    for cmd in ("pytest -q tests/t.py", "cmd 2>err.log >&2", "echo $X > $F",
+                "python3.11 s.py > /dev/null"):
+        assert shell_write_targets(cmd) == set(), cmd
+
+
+def test_shell_is_read_only():
+    for cmd in ("cat app.cfg", "grep -rn x . | wc -l", "git diff HEAD",
+                "ls 2>/dev/null", "cat a 2>&1 | grep x"):
+        assert shell_is_read_only(cmd), cmd
+    for cmd in ("cat a > b", "cat a | tee b", "echo $(rm x)", "git push",
+                "sed -n 1p a", "FOO=1 cat a", "cat a & rm b", "rm -rf x", ""):
+        assert not shell_is_read_only(cmd), cmd
+
+
+def test_shell_read_operands():
+    assert shell_read_operands("cat app.cfg")[0] == {"app.cfg"}
+    assert shell_read_operands("grep -n app.cfg notes.txt")[0] == {"notes.txt"}
+    assert "./app.cfg" in shell_read_operands("grep -rn x .", "./app.cfg:3:x=1")[0]
+    assert shell_read_operands("ls -l app.cfg") == (set(), {"app.cfg"})
+    assert shell_read_operands("echo app.cfg") == (set(), set())
+    assert shell_read_operands("git diff app.cfg")[0] == {"app.cfg"}
 
 
 # ------------------------------------------------------- bare-python runner

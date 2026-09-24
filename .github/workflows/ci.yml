@@ -32,6 +32,8 @@ jobs:
           python tests/test_verifiers.py
       - name: Demo
         run: python examples/demo.py
+      - name: Hallucination/error-rate benchmark (fails above 5% on any set)
+        run: python examples/hallucination_bench.py --max-error 0.05
       - name: Preset-tuning harness self-check (lcb-gate optional; exits 0 if absent)
         run: python examples/tune_presets.py
 

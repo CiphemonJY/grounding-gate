@@ -161,9 +161,16 @@ def turn_loop(script, state, verifier=None):
             state.current_step += 1
             obs = classify_observation(step["tool"], step["args"], step["result"],
                                        state, read_only=not step.get("mutating", False))
+            if not step.get("exit_ok", True):
+                # a FAILED read can still ground an assertion ("app.cfg is
+                # unreadable"), but it never saw the changed content, so it
+                # cannot verify a completion
+                obs["grounds_completion"] = False
             qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
             state.grounded_this_turn |= obs["grounds_assertion"]   # (C1) latch
-            state.verified_this_turn |= obs["grounds_completion"]  # (C1) latch
+            if obs["grounds_completion"] and state.cover_pending(
+                    step["tool"], step["args"], step["result"]):
+                state.verified_this_turn = True                    # (C1) latch
             if step.get("signals") and step.get("exit_ok", True):
                 # declarative-rails signal mapper (reference: script-declared)
                 state.verified_signals |= set(step["signals"])
@@ -172,7 +179,7 @@ def turn_loop(script, state, verifier=None):
                 state.halted = False                               # (C2) qualifying only
                 # retain the qualifying observation for the verifier tier +
                 # telemetry (WIRING layer only — classify_observation stays
-                # byte-identical and zero-LLM)
+                # free of telemetry and zero-LLM)
                 state.turn_observations.append(
                     {"tool": step["tool"], "args": step["args"],
                      "result": step["result"],
@@ -180,10 +187,10 @@ def turn_loop(script, state, verifier=None):
                 if obs["grounds_completion"]:
                     state.last_verification_step = state.current_step
             if step.get("mutating"):
-                state.last_mutation_step = state.current_step
                 # a NEW mutation invalidates prior verification — the
-                # verifying observation must postdate the LAST mutation
-                state.verified_this_turn = False
+                # verifying observation must postdate the LAST mutation, and
+                # every target it changed is owed a re-read
+                state.note_mutation(step["args"])
             trace.append(("tool_call", obs))
             continue
 

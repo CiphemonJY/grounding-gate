@@ -56,24 +56,30 @@ callables themselves are plain async functions you can also register by hand.
 """
 
 import json
+import re
 
 from ..boundary import ACCEPT, boundary_check
 from ..classifier import classify_observation
-from ..state import GateState, extract_identifiers
+from ..state import (GateState, extract_identifiers, shell_is_read_only,
+                     shell_read_operands, surface_hits)
 
 # Built-in SDK tools by consequence class. Unknown tools (including MCP tools)
 # are treated as NEITHER: they earn no grounding credit and record no
 # mutation — maximally conservative in both directions. Override per-agent.
 DEFAULT_READ_ONLY_TOOLS = frozenset(
     {"Read", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookRead"})
-# Bash is classed as mutating because it CAN mutate; the cost is that a
-# harmless bash call also opens the verified tier for later reads. Narrow
-# this set if your agent's bash usage is read-only.
+# Read-only tools that report what EXISTS (names, paths), not what a file now
+# says. They can ground an assertion but never verify a change.
+DEFAULT_LISTING_TOOLS = frozenset({"Glob"})
+# Read-only tools whose output is the content OF the path they were given.
+# Their relevance comes from that path, not from names the text mentions (a
+# notes file saying "bump app.cfg" is not a read of app.cfg).
+DEFAULT_CONTENT_TOOLS = frozenset({"Read", "NotebookRead"})
+# Bash is classed as mutating because it CAN mutate. A command built only
+# from known read-only programs (cat, grep, git diff, ...; see
+# state.shell_is_read_only) is the exception: it is treated as a read.
 DEFAULT_MUTATING_TOOLS = frozenset(
     {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
-
-# tool_input keys whose VALUES name what was touched
-_PATH_KEYS = ("file_path", "path", "notebook_path", "filename", "file")
 
 UNVERIFIED_BANNER = (
     "grounding-gate: exiting UNVERIFIED — the agent finished without a "
@@ -106,34 +112,44 @@ def _serialize(value):
         return str(value)
 
 
-def _mutation_identifiers(tool_input):
-    """Identifiers of WHAT a mutation touched — extracted from VALUES only.
+# an identifier that names a file: has a directory part or an extension
+_PATH_LIKE = re.compile(r"/|\.[A-Za-z0-9]{1,8}$")
 
-    JSON schema keys (``file_path``, ``content``) are shared across every
-    file tool; letting them into the claim surface would make a read of ANY
-    file pass the relevance gate. Path-like values are preferred when
-    present; otherwise all values contribute.
-    """
-    if isinstance(tool_input, dict):
-        path_vals = [v for k, v in tool_input.items()
-                     if k in _PATH_KEYS and isinstance(v, (str, int, float))]
-        if path_vals:
-            out = set()
-            for v in path_vals:
-                out |= extract_identifiers(str(v), "")
-            return out
-        out = set()
-        for v in tool_input.values():
-            out |= _mutation_identifiers(v)
-        return out
-    if isinstance(tool_input, (list, tuple)):
-        out = set()
-        for v in tool_input:
-            out |= _mutation_identifiers(v)
-        return out
-    if tool_input is None:
-        return set()
-    return extract_identifiers(str(tool_input), "")
+
+def _symbols(text):
+    """Non-path identifiers in file content (``parse_config`` in the source
+    that defines it), with dotted names also split into their parts so
+    ``settings.load_settings`` names ``load_settings``. File NAMES the text
+    mentions are left out: those files were not read."""
+    out = set()
+    for i in extract_identifiers("", text):
+        if not _PATH_LIKE.search(i):
+            out.add(i)
+            out.update(p for p in i.split(".") if p)
+    return out
+
+
+def _content_identifiers(args, result):
+    """Relevance for content tools: the path that was read, plus the
+    symbols in its text."""
+    return extract_identifiers(args, "") | _symbols(result)
+
+
+def _shell_identifiers(args, result):
+    """Relevance for a read-only shell call: the files it operates on (and
+    the ``path:`` prefixes a search prints), never a grep pattern or an echo
+    argument. Only consulted for shell reads: a mutating call grounds
+    nothing whatever it touches."""
+    try:
+        command = json.loads(args).get("command")
+    except (ValueError, AttributeError):
+        command = None
+    if not isinstance(command, str):
+        return extract_identifiers(args, result)
+    content, listed = shell_read_operands(command, result)
+    # output is file content only when a content program ran (not for a
+    # bare `echo load_settings`)
+    return content | listed | (_symbols(result) if content else set())
 
 
 class GateHooks:
@@ -155,6 +171,13 @@ class GateHooks:
             mutate-then-verify tasks; read-only/Q&A agents should use
             ``default``.
         read_only_tools / mutating_tools: override the consequence classes.
+        content_tools: read-only tools whose output is the content of the
+            path they were given (default ``{"Read", "NotebookRead"}``).
+            Their relevance comes from that path only, never from names the
+            text happens to mention. An entry in ``extractors`` overrides it.
+        listing_tools: read-only tools whose output names things rather than
+            showing their content (default ``{"Glob"}``). They can ground an
+            assertion but never verify a change.
         max_blocks: rejected stop attempts before the escape valve allows an
             UNVERIFIED exit (the typed-``unverified`` analog). The valve also
             opens if the reasoning budget exhausts first.
@@ -193,15 +216,22 @@ class GateHooks:
     def __init__(self, claim_surface=(), model_class="default",
                  read_only_tools=DEFAULT_READ_ONLY_TOOLS,
                  mutating_tools=DEFAULT_MUTATING_TOOLS,
+                 listing_tools=DEFAULT_LISTING_TOOLS,
+                 content_tools=DEFAULT_CONTENT_TOOLS,
                  max_blocks=3, gate_subagents=False,
                  normalizers=None, extractors=None,
                  verifier=None, emit_progress=False):
+        extractors = dict(extractors or {})
+        for tool in content_tools:
+            extractors.setdefault(tool, _content_identifiers)
+        for tool in mutating_tools:
+            extractors.setdefault(tool, _shell_identifiers)
         self.state = GateState.for_model_class(
             model_class, claim_surface=set(claim_surface),
-            normalizers=dict(normalizers or {}),
-            extractors=dict(extractors or {}))
+            normalizers=dict(normalizers or {}), extractors=extractors)
         self.read_only_tools = set(read_only_tools)
         self.mutating_tools = set(mutating_tools)
+        self.listing_tools = set(listing_tools)
         self.max_blocks = max_blocks
         self.gate_subagents = gate_subagents
         # optional verify_with tier: a verifier can DOWNGRADE a grounded finish
@@ -232,25 +262,34 @@ class GateHooks:
 
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
-        read_only = tool in self.read_only_tools
+        shell_read = self._is_shell_read(tool, tool_input)
+        read_only = tool in self.read_only_tools or shell_read
 
         obs = classify_observation(tool, args, result, self.state, read_only)
+        if shell_read and not surface_hits(
+                shell_read_operands(tool_input["command"], result)[0],
+                self.state.claim_surface):
+            obs["grounds_completion"] = False   # listed, not shown
+        if tool in self.listing_tools:
+            # a listing shows the file exists, not what the change wrote
+            obs["grounds_completion"] = False
         qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
         self.state.grounded_this_turn |= obs["grounds_assertion"]
-        self.state.verified_this_turn |= obs["grounds_completion"]
+        if obs["grounds_completion"] and self.state.cover_pending(tool, args, result):
+            self.state.verified_this_turn = True
         if qualifying:
             self.state.budget = min(
                 self.state.budget + self.state.refill, self.state.cap)
             self.state.halted = False
             # retain the qualifying observation for the verifier tier +
             # telemetry, and advance the monotonic verification marker — mirrors
-            # turn_loop; classify_observation (Module 2) stays untouched
+            # turn_loop; classify_observation (Module 2) stays free of telemetry
             self.state.turn_observations.append(
                 {"tool": tool, "args": args, "result": result,
                  "tier": "verified" if obs["grounds_completion"] else "observed"})
             if obs["grounds_completion"]:
                 self.state.last_verification_step = self.state.current_step
-        if tool in self.mutating_tools:
+        if tool in self.mutating_tools and not shell_read:
             self._record_mutation(tool_input)
         return {}
 
@@ -263,8 +302,10 @@ class GateHooks:
             return {}
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
-        if input_data.get("tool_name", "") in self.mutating_tools:
-            self._record_mutation(input_data.get("tool_input", ""))
+        tool = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input", "")
+        if tool in self.mutating_tools and not self._is_shell_read(tool, tool_input):
+            self._record_mutation(tool_input)
         return {}
 
     async def stop(self, input_data, tool_use_id, context):
@@ -357,14 +398,19 @@ class GateHooks:
 
     # ------------------------------------------------------------ internals
 
+    def _is_shell_read(self, tool, tool_input):
+        """A mutating-class shell call (``{"command": ...}``) that only runs
+        read-only programs, e.g. ``cat app.cfg``: it observes like a Read and
+        records no mutation."""
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        return (tool in self.mutating_tools and isinstance(command, str)
+                and shell_is_read_only(command))
+
     def _record_mutation(self, tool_input):
-        self.state.last_mutation_step = self.state.current_step
-        # a NEW mutation invalidates any earlier verification: the verifying
-        # observation must postdate the LAST mutation
-        self.state.verified_this_turn = False
-        # you must verify what you changed: mutated identifiers join the
-        # claim surface so only reads of THOSE count as verification
-        self.state.claim_surface |= _mutation_identifiers(tool_input)
+        # a NEW mutation invalidates any earlier verification, its targets are
+        # owed a re-read, and mutated identifiers join the claim surface so
+        # only reads of THOSE count as verification
+        self.state.note_mutation(tool_input)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier

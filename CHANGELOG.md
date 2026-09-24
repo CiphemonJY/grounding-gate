@@ -10,6 +10,30 @@
 - README quickstart: the mutation bookkeeping now also clears
   `verified_this_turn`, matching `turn_loop`. Without it, a verification taken
   before a second mutation stayed latched and could ground a completion.
+- New labeled benchmark, `examples/hallucination_bench.py`: 112 transcript
+  families (design set + 7 held-out sets written round by round), each run
+  over seeded variations through `turn_loop` and the Agent SDK adapter. The
+  structural error rate (leaked ungrounded claims + blocked grounded ones)
+  goes from 34.2% on 0.4.1 to 0.0%; CI fails above 5%. Changes it drove:
+  - Relevance matches paths by trailing components (`./app.cfg`,
+    `proj/app.cfg`, `/srv/proj/app.cfg`), but not other directories or URLs.
+  - Per-target completion coverage: every change with a nameable target must
+    be re-read after it (new `GateState.pending_verification`,
+    `note_mutation`, `cover_pending`; shown in `progress()`). Re-reading one
+    of two edited files, or an unchanged neighbour, no longer verifies. `rm`
+    (globs included) discharges a deleted file.
+  - `turn_loop` adds mutated identifiers to the claim surface (as the adapter
+    already did) and gives a failed call (`exit_ok: False`) no completion
+    credit.
+  - Adapter: `Glob` is a listing tool (assertion tier only); `Read` and
+    `NotebookRead` are content tools, relevant to the path read and the
+    symbols in its text, not to file names it mentions; read-only shell
+    commands (`cat`, `grep`, `git diff`, ...) count as reads of their file
+    operands instead of as mutations; shell writes via `>`, `>>`, `tee` and
+    `sed -i` are tracked as targets. New `content_tools=` / `listing_tools=`
+    arguments.
+  - Behavior change: a user-declared *path* on the claim surface is no
+    longer satisfied by a `Read` of some other file whose text mentions it.
 - CI tests every supported Python (3.9-3.13), builds the sdist/wheel with
   `twine check`, and imports the installed wheel with no extras. The release
   workflow refuses a tag that doesn't match the package version.
