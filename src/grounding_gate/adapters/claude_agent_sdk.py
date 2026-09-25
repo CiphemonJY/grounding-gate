@@ -314,6 +314,17 @@ class GateHooks:
             through the same block/budget/escape machinery — the verifier can
             add strictness but can never bypass the gate or trap the agent.
             Default None (the floor runs alone, zero-LLM).
+        strict_reads: when True, only a direct file read can verify a change:
+            a content tool (``Read``, ``NotebookRead``, an MCP ``read_file``
+            style tool) of each changed file after its last change. The shell
+            parser may add obligations but never relax one: every Bash call
+            counts as an unknown change that owes a fresh Read of every file
+            changed earlier this turn plus whatever it writes; nothing it
+            prints counts as a read; its moves and deletes only apply to files
+            it created itself. Grep, listings and web tools can ground an
+            answer but never verify a change. A parser mistake can therefore
+            only block honest work, never let an unbacked claim through. The
+            cost: one more Read after running tests or scripts. Default False.
         emit_progress: when True, the escape-valve ``systemMessage`` is suffixed
             with a compact ``progress()`` summary (a best-effort, user-facing
             event per the SDK contract). Default False. The reliable programmatic
@@ -333,7 +344,8 @@ class GateHooks:
                  remote_tools=DEFAULT_REMOTE_TOOLS,
                  max_blocks=3, gate_subagents=False,
                  normalizers=None, extractors=None,
-                 verifier=None, emit_progress=False, home=None):
+                 verifier=None, emit_progress=False, home=None,
+                 strict_reads=False):
         extractors = dict(extractors or {})
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
@@ -357,6 +369,8 @@ class GateHooks:
         # opt-in: append a zero-token progress summary to the escape-valve
         # systemMessage (best-effort event; progress() is the reliable surface)
         self.emit_progress = emit_progress
+        self.strict_reads = bool(strict_reads)
+        self.content_tools = set(content_tools)
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
@@ -408,6 +422,9 @@ class GateHooks:
                 or _grep_lists_files(tool, tool_input,
                                      input_data.get("tool_response"), result)):
             # a listing shows the file exists, not what the change wrote
+            obs["grounds_completion"] = False
+        if self.strict_reads and not (tool in self.content_tools or mcp == "content"):
+            # strict: only a direct file read verifies a change
             obs["grounds_completion"] = False
         qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
         self.state.grounded_this_turn |= obs["grounds_assertion"]
@@ -494,6 +511,7 @@ class GateHooks:
         # block every later turn over work the user has moved past
         self.state.pending_verification = set()
         self.state.pending_aliases = {}
+        self.state.changed_this_turn = set()
         self._mutated_this_turn = False
         self.state.turn_observations = []    # per-turn; load-bearing (else a long
         #                                      session leaks retained observations).
@@ -518,6 +536,7 @@ class GateHooks:
             "max_blocks": self.max_blocks,
             "tool_calls_this_turn": self._tool_calls_this_turn,
             "exited_unverified": self.exited_unverified,
+            "strict_reads": self.strict_reads,
         })
         return p
 
@@ -548,7 +567,9 @@ class GateHooks:
     def _is_shell_read(self, tool, tool_input):
         """A mutating-class shell call (``{"command": ...}``) that only runs
         read-only programs, e.g. ``cat app.cfg``: it observes like a Read and
-        records no mutation."""
+        records no mutation. Never in strict mode, where shell is opaque."""
+        if self.strict_reads:
+            return False
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         return (tool in self.mutating_tools and isinstance(command, str)
                 and shell.is_read_only(command, self._home))
@@ -571,7 +592,9 @@ class GateHooks:
         # owed a re-read, and mutated identifiers join the claim surface so
         # only reads of THOSE count as verification
         self._mutated_this_turn = True
-        self.state.note_mutation(tool_input, self._cwd, output, failed, self._home)
+        is_shell = isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str)
+        self.state.note_mutation(tool_input, self._cwd, output, failed, self._home,
+                                 strict=self.strict_reads and is_shell)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier
@@ -593,6 +616,12 @@ class GateHooks:
             missing.append(
                 "changed but not re-read since: " + ", ".join(owed) +
                 " (read each one after its last change)")
+        if claim_type == "completion" and self.strict_reads \
+                and not self.state.verified_this_turn:
+            missing.append(
+                "strict reads: only a direct file read (the Read tool) after "
+                "your last change verifies it; shell output and search results "
+                "don't count, and any Bash command counts as a new change")
         elif claim_type == "completion" and not self.state.verified_this_turn:
             missing.append(
                 "no verified-tier observation: re-read what you modified "

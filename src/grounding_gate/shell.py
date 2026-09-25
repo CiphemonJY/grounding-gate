@@ -275,10 +275,15 @@ class Stage:
     previous one, and the directory and home relative paths resolve
     against."""
 
-    def __init__(self, argv, redirects, subst, piped, piped_in, cwd, home, sep=";"):
+    def __init__(self, argv, redirects, subst, piped, piped_in, cwd, home, sep=";",
+                 cwd_alt=None):
         self.argv, self.redirects, self.subst = argv, redirects, subst
         self.piped, self.piped_in = piped, piped_in
         self.cwd, self.home, self.sep = cwd, home, sep
+        # after `cd x;` (not `&&`) the cd may have failed: the command then
+        # ran in cwd_alt instead. Reads under an uncertain directory earn no
+        # credit; writes are owed at both places.
+        self.cwd_alt = cwd_alt
 
     def resolve(self, path):
         return resolve(path, self.cwd, self.home)
@@ -347,11 +352,12 @@ def parse(command, cwd="", home=None):
         return None
     base = posixpath.normpath(cwd) if cwd else ("" if cwd == "" else None)
     stages, saved, dirstack = Stages(), [], []
+    base_alt = None
     argv, redirects, subst = [], [], False
     expect_target, piped_in, just_closed = None, False, False
 
     def flush(sep):
-        nonlocal argv, redirects, subst, base, piped_in
+        nonlocal argv, redirects, subst, base, piped_in, base_alt
         piped = sep in ("|", "|&")
         if argv and argv[0] in _CLOSERS and (piped or redirects):
             stages.grouped_output = True
@@ -360,21 +366,24 @@ def parse(command, cwd="", home=None):
             words = words[1:]
         words = [w for w in words if w not in _CLOSERS]
         if words or redirects or subst:
-            stages.append(Stage(list(words), redirects, subst, piped, piped_in,
-                                base, home, sep))
+            stage = Stage(list(words), redirects, subst, piped, piped_in,
+                          base, home, sep, base_alt)
+            stage.raw = list(argv)          # with assignments, for substitutions
+            stages.append(stage)
             name = words[0] if words else ""
             if name in ("cd", "pushd", "popd") and not piped and sep != "&" \
                     and not piped_in:
                 if name == "popd":
-                    base = dirstack.pop() if dirstack else None
+                    new = dirstack.pop() if dirstack else None
                 else:
                     target = _cd_target(words)
                     if name == "pushd":
                         dirstack.append(base)
-                    # after `cd x;` the next command runs even if cd failed,
-                    # so only `cd x && ...` pins where it runs
-                    base = None if target == "-" or sep != "&&" \
-                        else resolve(target, base, home)
+                    new = None if target == "-" else resolve(target, base, home)
+                # after `cd x;` the next command runs even if cd failed, so
+                # only `cd x && ...` pins where it runs
+                base_alt = None if sep == "&&" else base
+                base = new
         piped_in = piped
         argv, redirects, subst = [], [], False
 
@@ -396,11 +405,11 @@ def parse(command, cwd="", home=None):
             expect_target = value
         elif value == "(":
             flush(";")
-            saved.append(base)
+            saved.append((base, base_alt))
         elif value == ")":
             flush(";")
             if saved:
-                base = saved.pop()
+                base, base_alt = saved.pop()
             just_closed = True
         else:                                    # | |& ; && || & ;;
             flush(value)
@@ -633,8 +642,7 @@ def _writes_via_option(name, args):
     """Read-only-looking programs that write a file through an option."""
     opts, _ = _split_args(name, args)
     if name == "sort":
-        return any(f in ("-o", "--output") or f.startswith("--output=") for f, _ in opts) \
-            or "o" in _short_flags(opts)
+        return bool(_sort_outputs(args))
     if name == "tree":
         return "o" in _short_flags(opts) or any(f.startswith("--output")
                                                 for f, _ in opts)
@@ -818,12 +826,16 @@ def _stage_reads(stage, output, attribute):
     if name in _PASS_THROUGH or name in _CONTENT:
         content += [t for fd, op, t in stage.redirects if op == "<" and fd in ("", "0")]
     placed = []
+    uncertain = stage.cwd_alt is not None and stage.cwd_alt != cwd
     for group in (content, listed):
         out = set()
         for p in group:
             if p.startswith("\0"):
-                out |= _repo_candidates(p[1:], cwd)
+                if not uncertain:
+                    out |= _repo_candidates(p[1:], cwd)
             elif ":" not in p or p.startswith("/") or p.startswith("."):
+                if uncertain and not p.startswith("/") and not p.startswith("~"):
+                    continue
                 r = resolve(p, cwd, stage.home)
                 if r:
                     out.add(r)
@@ -995,17 +1007,89 @@ def _writes(stage):
         if in_place:
             out += files
     elif name == "sort":
-        opts, _ = _split_args("sort", args)
-        out += [v for f, v in opts if f in ("-o", "--output") and v]
+        out += _sort_outputs(args)
+    elif name in ("awk", "gawk") and _awk_in_place(args):
+        out += _split_args("awk", args)[1][1:]
+    elif name == "perl" and _perl_in_place(args):
+        out += _perl_files(args)
     placed = []
     for p in out:
-        if not set(p) & set("*?[") and not _harmless_target(">", p):
-            r = resolve(p, cwd, stage.home)
-            if r:
-                placed.append((r, None))
+        if set(p) & set("*?[") or _harmless_target(">", p):
+            continue
+        r = resolve(p, cwd, stage.home)
+        alt = resolve(p, stage.cwd_alt, stage.home) if stage.cwd_alt is not None else None
+        if r:
+            placed.append((r, alt if alt and alt != r else None))
+        elif alt:
+            placed.append((alt, None))
+        else:
+            placed.append((UNPLACED + p, None))
     if name == "cp":
         placed += _copy_targets(name, args, cwd, stage.home)
     return placed
+
+
+# prefix of a write the parser could not place (``cd $DIR && sed -i ... f``,
+# ``echo x > $OUT``): no read can pay it, which strict mode wants
+UNPLACED = "<unplaced write> "
+
+
+def _awk_in_place(args):
+    """gawk ``-i inplace`` / ``-iinplace`` / ``--include=inplace``."""
+    for k, a in enumerate(args):
+        if a in ("-i", "--include") and k + 1 < len(args) and "inplace" in args[k + 1]:
+            return True
+        if (a.startswith("-i") or a.startswith("--include=")) and "inplace" in a:
+            return True
+    return False
+
+
+def _perl_in_place(args):
+    """``perl -i``, ``-pi``, ``-i.bak``, ``-pi -e ...``."""
+    return any(a.startswith("-") and not a.startswith("--") and "i" in a[1:]
+               and not a.startswith("-I") for a in args if a != "-")
+
+
+def _perl_files(args):
+    """Files after perl's options and ``-e``/``-E`` programs."""
+    files, k, has_e = [], 0, False
+    while k < len(args):
+        a = args[k]
+        if a in ("-e", "-E") and k + 1 < len(args):
+            has_e = True
+            k += 2
+            continue
+        if a.startswith("-"):
+            has_e = has_e or a.endswith("e") and len(a) > 1 and not a.startswith("--")
+            if a.endswith("e") and k + 1 < len(args) and not a.startswith("--"):
+                k += 2                     # bundled -pie 'program'
+                continue
+            k += 1
+            continue
+        files.append(a)
+        k += 1
+    return files if has_e else files[1:]   # without -e the first is the script
+
+
+def _sort_outputs(args):
+    """``sort -o F``, ``-uo F``, ``-oF``, ``--output=F``, ``--output F``."""
+    out, k = [], 0
+    while k < len(args):
+        a = args[k]
+        if a.startswith("--output="):
+            out.append(a.split("=", 1)[1])
+        elif a == "--output" and k + 1 < len(args):
+            out.append(args[k + 1])
+            k += 1
+        elif a.startswith("-") and not a.startswith("--") and "o" in a[1:]:
+            rest = a[a.index("o", 1) + 1:]
+            if rest:
+                out.append(rest)
+            elif k + 1 < len(args):
+                out.append(args[k + 1])
+                k += 1
+        k += 1
+    return out
 
 
 def _moves(stage):
@@ -1080,11 +1164,60 @@ def _removes(stage):
     return out
 
 
+def _substitutions(stage, process=True):
+    """The command texts inside a stage's substitutions: ``$(...)``,
+    backticks, and (with ``process``) ``<(...)``/``>(...)``, in words and
+    redirect targets."""
+    texts = [str(w) for w in getattr(stage, "raw", stage.argv)] + \
+        [t for _, _, t in stage.redirects]
+    out = []
+    for text in texts:
+        i = 0
+        while i < len(text):
+            if text.startswith("$(", i) or process and (
+                    text.startswith("<(", i) or text.startswith(">(", i)):
+                try:
+                    j = _read_balanced(text, i + 2)
+                except ValueError:
+                    break
+                out.append(text[i + 2:j - 1])
+                i = j
+            elif text[i] == "`":
+                j = text.find("`", i + 1)
+                if j < 0:
+                    break
+                out.append(text[i + 1:j])
+                i = j + 1
+            else:
+                i += 1
+    return out
+
+
+def _inner_writes(stage, cwd, home, strict=False, depth=0):
+    """Files written by commands inside a stage's substitutions (``x=$(sed
+    -i ... f)``). Their output was captured, not shown, so only their writes
+    matter; nested substitutions are followed a few levels deep. Process
+    substitutions (``> >(tee log)``) are usually logging, so only strict
+    mode owes what they write."""
+    found = []
+    if depth > 4:
+        return found
+    for text in _substitutions(stage, process=strict):
+        inner = parse(text, cwd, home)
+        for s in inner or ():
+            found += _writes(s)
+            if s.subst:
+                found += _inner_writes(s, cwd, home, strict, depth + 1)
+    return found
+
+
 _KNOWN_EFFECTS = frozenset({"tee", "sed", "mv", "git mv", "rm", "git rm",
                             "unlink", "rmdir", "mkdir", "touch", "cp", "sort"})
+# note: awk -i inplace and perl -i writes are recorded, but those programs
+# stay opaque (a script can do anything else too)
 
 
-def effects(command, cwd="", output="", home=None):
+def effects(command, cwd="", output="", home=None, strict=False):
     """Ordered effects of a (possibly mutating) command:
     ``("write", path, alt)``, ``("move", src, dst, alt)``,
     ``("remove", path, recursive)``, ``("read", path)`` for content a stage
@@ -1107,6 +1240,9 @@ def effects(command, cwd="", output="", home=None):
             if not known:
                 out.append(("opaque",))
             out += [("write",) + w for w in _writes(stage)]
+            if stage.subst:
+                out += [("write",) + w for w in _inner_writes(stage, stage.cwd,
+                                                               stage.home, strict)]
             out += [("move",) + m for m in _moves(stage)]
             out += [("remove",) + r for r in _removes(stage)]
             if _stage_read_only(stage):

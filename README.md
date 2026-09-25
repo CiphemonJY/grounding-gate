@@ -312,6 +312,24 @@ file names a document merely mentions do not. Override with
 The adapter adds no dependency: grounding-gate stays stdlib-only, and only
 `as_options_hooks()` requires `claude-agent-sdk` to be installed.
 
+## Strict reads
+
+For high-stakes runs, `GateHooks(strict_reads=True)` trusts only direct file
+reads. A claim of change is accepted only after the `Read` tool (or
+`NotebookRead`, or an MCP `read_file`-style tool) has shown every file
+changed this turn, after its last change and after the last shell command.
+
+- Shell output never counts as evidence, and every Bash call counts as a
+  possible change to everything changed so far this turn: run your tests,
+  then Read the files you changed.
+- The shell parser can only add obligations (files a command writes are
+  owed), never remove them, so a parser mistake can block honest work but
+  never let an unbacked claim through.
+- Grep, Glob and web tools can ground an answer, never verify a change.
+- The price, measured by the benchmark: it blocks 47% of the benchmark's
+  honest transcripts (the ones that verify through shell or search), and
+  moving or deleting a changed file ends the turn unverified.
+
 ## Measuring the error rate
 
 [examples/hallucination_bench.py](https://github.com/CiphemonJY/grounding-gate/blob/main/examples/hallucination_bench.py)

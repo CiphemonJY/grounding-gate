@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Strict reads** (`GateHooks(strict_reads=True)`): a claim of change is
+  accepted only after a direct file read (`Read`, `NotebookRead`, an MCP
+  `read_file`-style tool) of every file changed this turn, taken after its
+  last change and after the last shell command. The shell parser may add
+  obligations but never relax one: every Bash call re-owes the turn's
+  changed files plus whatever it writes (at every place a `cd x;` may have
+  left it); nothing it prints counts as a read; its moves and deletes only
+  apply to files it created itself; a write it can't place blocks
+  verification. A parser mistake can therefore only block honest work,
+  never pass an unbacked claim. Grep, listings and web tools can ground an
+  answer but never verify a change. Checked by `tests/test_strict_reads.py`
+  (every leak from the three reviews rejected; a property test against an
+  independent oracle of the rule) and by the benchmark (0 leaking families;
+  it blocks 47% of the benchmark's honest transcripts, which verify through
+  shell or search).
+- Writes inside command substitutions (`x=$(sed -i ... f)`, backticks) are
+  owed in both modes; `awk -i inplace` and `perl -i` are recorded as
+  writes; `sort -uo F` bundles are seen; after `cd x;` a write is owed at
+  both possible places.
+
 ## 0.5.0 — 2026-09-25
 
 Minor version because verification is stricter: every edited file must be

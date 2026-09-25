@@ -58,6 +58,9 @@ class GateState:
     pending_verification: set = field(default_factory=set)
     # owed entry -> the other path that also pays it (an ambiguous `mv a b`)
     pending_aliases: dict = field(default_factory=dict)
+    # every file changed this turn; strict reads owes them all again after
+    # any shell command (it may have changed them). Reset with the turn.
+    changed_this_turn: set = field(default_factory=set)
     # per-turn latches
     grounded_this_turn: bool = False
     verified_this_turn: bool = False
@@ -96,7 +99,8 @@ class GateState:
                 "budget meaningless" % (refill, cap))
         return cls(budget=cap, cap=cap, refill=refill, **kw)
 
-    def note_mutation(self, args, cwd="", output="", failed=False, home=None):
+    def note_mutation(self, args, cwd="", output="", failed=False, home=None,
+                      strict=False):
         """Record a mutating call at ``current_step``.
 
         A completion now needs a fresh read AFTER this step, earlier
@@ -120,7 +124,9 @@ class GateState:
                 # owed: the file may not exist, and then no read could pay
                 self.claim_surface |= mutation_identifiers(args)
                 return
-            self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
+            targets = mutation_targets(args, self.claim_surface, cwd)
+            self.pending_verification |= targets
+            self.changed_this_turn |= targets
             self.claim_surface |= mutation_identifiers(args)
             src, dst = (args.get("source"), args.get("destination")) \
                 if isinstance(args, dict) else (None, None)
@@ -128,14 +134,20 @@ class GateState:
                 self._move(_under(cwd, src), _under(cwd, dst), None)
             return
         from . import shell
-        effs = shell.effects(command, cwd, output, home)
+        effs = shell.effects(command, cwd, output, home, strict)
+        if strict:
+            self._note_shell_strictly(effs)
+            return
         if effs is None:
             return                     # unparseable: freshness still applies
         for eff in effs:
             kind = eff[0]
+            if kind == "write" and eff[1].startswith(shell.UNPLACED):
+                continue       # can't be placed: freshness is all we can ask
             if kind == "write":
                 # a failed command may have stopped anywhere, but what it
                 # wrote before failing is still changed: owe it
+                self.changed_this_turn.add(eff[1])
                 self.pending_verification.add(eff[1])
                 self.claim_surface.add(eff[1])
                 if eff[2]:
@@ -165,6 +177,39 @@ class GateState:
                 trailing, self.claim_surface):
             self.verified_this_turn = True
             self.last_verification_step = self.current_step
+
+    def _note_shell_strictly(self, effs):
+        """Strict reads: the shell parser may ADD obligations, never relax
+        one. Any command is an unknown change, so every file changed earlier
+        this turn is owed again; files it writes are owed too. Parsed moves
+        and removals apply only to files this same command created (a temp
+        file written then moved or deleted), so a misparse can at worst
+        block honest work, never clear a real debt. Nothing it printed
+        counts as a read."""
+        self.pending_verification |= self.changed_this_turn
+        created = set()
+        for eff in effs or ():
+            kind = eff[0]
+            if kind == "write":
+                # every candidate place is owed on its own (an alias would
+                # let a read of the wrong one pay); an unplaced write can
+                # never be paid, so the turn ends unverified
+                for path in filter(None, eff[1:3]):
+                    self.pending_verification.add(path)
+                    self.claim_surface.add(path)
+                    created.add(path)
+            elif kind == "remove":
+                for e in _removed({eff[1]}, created, eff[2]):
+                    self._drop(e)
+                    created.discard(e)
+            elif kind == "move" and eff[3] != "*glob*":
+                for e in created & surface_hits({eff[1]}, created):
+                    self._drop(e)
+                    created.discard(e)
+                    self.pending_verification.add(eff[2])
+                    self.claim_surface.add(eff[2])
+                    created.add(eff[2])
+        self.changed_this_turn |= created
 
     def _drop(self, entry):
         self.pending_verification.discard(entry)
