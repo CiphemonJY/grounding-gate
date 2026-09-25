@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.5.0 — 2026-09-25
+
+Minor version because verification is stricter: every edited file must be
+re-read, and file listings, counts, `git diff --stat`, `jq length` and
+output sent to `/dev/null` no longer verify a change. See below.
+
+- `boundary_check` now fails CLOSED on an unknown `claim_type` (raises
+  `ValueError`). Previously a typo such as `"assertoin"` fell through to the
+  exempt `none` branch and was ACCEPTed with no grounding.
+- `grounding_gate.__version__` reported `0.4.0` in the 0.4.1 release; it now
+  matches `pyproject.toml`, and a test pins the two together.
+- README quickstart: the mutation bookkeeping now also clears
+  `verified_this_turn`, matching `turn_loop`. Without it, a verification taken
+  before a second mutation stayed latched and could ground a completion.
+- New labeled benchmark, `examples/hallucination_bench.py`: 180 transcript
+  families (design set + 12 held-out sets written round by round), each run
+  over seeded variations through `turn_loop` and the Agent SDK adapter. The
+  structural error rate (leaked ungrounded claims + blocked grounded ones)
+  goes from 40.4% on 0.4.1 to 0.0%; CI fails above 5%. Changes it drove:
+  - Relevance matches paths by trailing components (`./app.cfg`,
+    `proj/app.cfg`, `/srv/proj/app.cfg`), but not other directories or URLs.
+  - Per-target completion coverage: every change with a nameable target must
+    be re-read after it (new `GateState.pending_verification`,
+    `note_mutation`, `cover_pending`; shown in `progress()`). Re-reading one
+    of two edited files, or an unchanged neighbour, no longer verifies. `rm`
+    (globs included) discharges a deleted file.
+  - `turn_loop` adds mutated identifiers to the claim surface (as the adapter
+    already did) and gives a failed call (`exit_ok: False`) no completion
+    credit.
+  - Adapter: `Glob` is a listing tool (assertion tier only); `Read` and
+    `NotebookRead` are content tools, relevant to the path read and the
+    symbols in its text, not to file names it mentions; read-only shell
+    commands (`cat`, `grep`, `git diff`, ...) count as reads of their file
+    operands instead of as mutations; shell writes via `>`, `>>`, `tee` and
+    `sed -i` are tracked as targets. New `content_tools=` / `listing_tools=`
+    arguments.
+  - Shell reads follow what reaches the agent: `sed -n`/`awk` print-only
+    views and `python -m json.tool FILE` count; output piped into `wc`,
+    sent to `/dev/null`, or from `grep -q/-c/-l` does not. `cd`, subshells
+    and the hook's `cwd` are followed when resolving paths; `..` is
+    normalized. `git show REV:path` never verifies; a bare `git diff`
+    credits the files in its `+++ b/` headers.
+  - Adapter: `Grep` in `files_with_matches`/`count` mode is a listing; the
+    reference MCP filesystem server's tools are classified (content /
+    listing / mutating). `turn_loop` tracks list-form args as targets.
+  - Behavior change: a user-declared *path* on the claim surface is no
+    longer satisfied by a `Read` of some other file whose text mentions it.
+- Independent adversarial review (21 findings, all reproduced) and the fixes,
+  pinned by `tests/test_review_findings.py`:
+  - Shell commands are parsed by a new quote- and heredoc-aware lexer
+    (`grounding_gate.shell`) instead of regular expressions: heredoc bodies,
+    quoted `|`/`>`, `2>&1`, `&>`, `~`, `sed -i ''`, `git -C`/`--no-pager`
+    and env-assignment prefixes are handled.
+  - A mutating shell command's effects apply in order: a temp file written
+    then moved or deleted is never left owed (`jq ... > tmp && mv tmp f`),
+    and content the same command showed after its last change verifies it.
+  - Moves carry debt to the destination (`mv`, `git mv`, `mv -t`, directory
+    moves, MCP `move_file`); `rm -r` clears what was owed under a directory;
+    a failed command clears nothing.
+  - Paths are whole identifiers (`a.cfg~`, `my notes.txt`, `a.cfg:Zone...`
+    no longer alias); symbols from file text can't pay a file's debt
+    (`Symbol`); only content a command showed can pay, not files it listed,
+    counted, sent to `/dev/null`, or printed as a summary (`--stat`, `-q`,
+    `sed -n '$='`, `awk 'END{...}'`, `git show REV`).
+  - Adapter: the Bash `{"stdout": ...}` response is parsed; `WebFetch`/
+    `WebSearch` never verify a change; `Grep` is relevant only to files whose
+    lines it printed; owed re-reads and the completion claim are per turn;
+    a missing `tool_name` no longer crashes.
+- Second independent review, of the new parser (23 findings, all
+  reproduced, all pinned in `tests/test_review_findings.py`). The rule is
+  now to fail toward "unknown", never toward a guess:
+  - In-place edits hidden in flag bundles (`sed -ni`, `sed -Ei`, `sort -uo`,
+    `awk -i inplace`, `tree -o`) and substitutions in assignment-only
+    stages (`x=$(sed -i ...)`) count as writes.
+  - Option values are never taken for a pattern or a file (`grep -A 3`,
+    `grep -e PAT`); `path:` prefixes and diff headers credit a file only when
+    one stage produced the whole output and the path lies under what it
+    searched; git's index and other commits (`--cached`, `A..B`, `git grep
+    REV`, `git show`) never verify the working tree; a repo-root diff
+    header can't pay for a same-named file elsewhere.
+  - `~` resolves to the real home directory (`GateHooks(home=...)` to
+    override); `pushd`/`popd`, background `cd x &`, `cd -P`, `if`/`then`
+    keywords, ANSI-C quotes, `((...))` arithmetic and quoted heredoc
+    delimiters are handled; `git rm --cached`/`-n` remove nothing.
+  - Devices, process substitutions and closed descriptors are never owed;
+    BSD `sed -i .bak`, directory renames (`mv src/ lib/`), moving a file
+    that was already moved, and `rm -rf dir/*` are followed.
+  - The `sed` script matcher no longer backtracks (an 11 s input now takes
+    under 1 ms); path matching is linear in the output size; a `tool_name`
+    of any type no longer crashes.
+- Third independent review (18 findings: 1 high-, 8 medium-, 9
+  low-realism; 0 crashes), all pinned in `tests/test_review_findings.py`:
+  - Content counts only if it reached the agent intact: every later
+    pipeline stage must pass lines on (`cat a | wc -l | tr -d ' '` does
+    not); nothing printed means nothing shown; output from programs that
+    print only on a match (grep, diff, git diff) needs a sole producer; a
+    background `&`, a group whose output is piped or redirected, or `A || B`
+    (except `A || true`) earns no read credit; `cd x;` (not `&&`) leaves the
+    directory unknown.
+  - jq counts only for plain selectors (not `length`, `keys`, `empty`);
+    `awk '{print NF}'` and attached `-iinplace` are handled; `sed -e ... -i
+    FILE` and `--expression=` are read correctly; `git diff`/`git blame`
+    with ambiguous refs (`main feature`), `--cached` or a revision, and
+    `git grep` on the index or a branch, never verify the working tree;
+    a multi-file `git diff` credits only files in its headers.
+  - `cp` destinations are owed (ambiguous `cp a b` pays at b or b/a); glob
+    moves (`mv *.cfg archive/`) carry debt; an absolute `rm -rf /tmp/x`
+    can't clear `/p/tmp/x`.
+  - A failed Bash command still owes what it wrote (it clears nothing);
+    a failed Edit/Write owes nothing but its path stays relevant.
+  - `$(...)` inside double quotes is balanced (Claude Code's
+    `git commit -m "$(cat <<'EOF' ...)"` messages no longer invent writes);
+    substitutions inside an unquoted heredoc body make the command unknown.
+  - Path matching caches normalized forms, keeping long sessions linear.
+- CI tests every supported Python (3.9-3.13), builds the sdist/wheel with
+  `twine check`, and imports the installed wheel with no extras. The release
+  workflow refuses a tag that doesn't match the package version.
+
 ## 0.4.1 — 2026-09-15
 
 - Packaging only; no functional change. Corrects the package author metadata,

@@ -312,6 +312,174 @@ def test_turn_observations_reset():
     assert gate.state.turn_observations == []           # emptied by the turn reset
 
 
+# ------------------------------------------- tool classes, shell, coverage
+
+def _edit_then(*events, surface=()):
+    gate = GateHooks(claim_surface=set(surface))
+    run(gate.post_tool_use(ptu("Edit", {"file_path": "/p/app.cfg"}, "ok"), "t0", None))
+    for i, ev in enumerate(events):
+        run(gate.post_tool_use(ev, "t%d" % (i + 1), None))
+    return run(gate.stop(STOP, None, None))
+
+
+def test_glob_listing_cannot_verify_an_edit():
+    out = _edit_then(ptu("Glob", {"pattern": "*.cfg"}, "/p/app.cfg"))
+    assert out["decision"] == "block"
+
+
+def test_read_is_relevant_to_its_path_not_text_it_mentions():
+    gate = GateHooks(claim_surface={"app.cfg"})
+    run(gate.post_tool_use(ptu("Read", {"file_path": "/p/notes.txt"},
+                               "TODO: bump app.cfg"), "t1", None))
+    assert run(gate.stop(STOP, None, None))["decision"] == "block"
+
+
+def test_shell_cat_verifies_but_ls_echo_and_grep_pattern_do_not():
+    assert _edit_then(ptu("Bash", {"command": "cat app.cfg"}, "retries=5")) == {}
+    for cmd, out in (("ls -l app.cfg", "-rw 12 app.cfg"),
+                     ("echo updated app.cfg", "updated app.cfg"),
+                     ("grep -n app.cfg notes.txt", "3: app.cfg")):
+        assert _edit_then(ptu("Bash", {"command": cmd}, out))["decision"] == "block", cmd
+
+
+def test_shell_read_records_no_mutation():
+    gate = GateHooks(claim_surface={"svc.cfg"})
+    run(gate.post_tool_use(ptu("Bash", {"command": "cat svc.cfg"}, "a=1"), "t1", None))
+    assert gate.state.last_mutation_step == 0
+    assert run(gate.stop(STOP, None, None)) == {}   # a plain grounded assertion
+
+
+def test_every_edited_file_must_be_reread():
+    gate = GateHooks()
+    run(gate.post_tool_use(ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"), "t1", None))
+    run(gate.post_tool_use(ptu("Write", {"file_path": "/p/b.cfg"}, "ok"), "t2", None))
+    run(gate.post_tool_use(ptu("Read", {"file_path": "/p/a.cfg"}, "a=1"), "t3", None))
+    assert run(gate.stop(STOP, None, None))["decision"] == "block"
+    assert gate.progress()["pending_verification"] == ["/p/b.cfg"]
+    run(gate.post_tool_use(ptu("Read", {"file_path": "b.cfg"}, "b=2"), "t4", None))
+    assert run(gate.stop(STOP, None, None)) == {}
+
+
+def test_shell_sed_targets_are_owed_a_reread():
+    gate = GateHooks()
+    run(gate.post_tool_use(ptu("Bash", {"command": "sed -i s/1/2/ a.cfg b.cfg"}, ""),
+                           "t1", None))
+    run(gate.post_tool_use(ptu("Read", {"file_path": "/p/a.cfg"}, "a=2"), "t2", None))
+    assert run(gate.stop(STOP, None, None))["decision"] == "block"
+
+
+def test_symbols_ground_through_read_and_shell_cat():
+    for event in (ptu("Read", {"file_path": "/p/src/cfg.py"}, "def parse_config(p):"),
+                  ptu("Read", {"file_path": "/p/src/app.py"}, "x = cfg.parse_config()"),
+                  ptu("Bash", {"command": "cat src/cfg.py"}, "def parse_config(p):")):
+        gate = GateHooks(claim_surface={"parse_config"})
+        run(gate.post_tool_use(event, "t1", None))
+        assert run(gate.stop(STOP, None, None)) == {}, event
+
+
+def test_echo_output_grounds_no_symbol():
+    gate = GateHooks(claim_surface={"parse_config"})
+    run(gate.post_tool_use(ptu("Bash", {"command": "echo parse_config"},
+                               "parse_config"), "t1", None))
+    assert run(gate.stop(STOP, None, None))["decision"] == "block"
+
+
+def test_deleted_scratch_file_is_not_owed():
+    for rm in ("rm tmp1.txt", "rm -f tmp*.txt", "rm ./tmp1.txt"):
+        gate = GateHooks()
+        run(gate.post_tool_use(ptu("Write", {"file_path": "/p/tmp1.txt"}, "ok"), "t1", None))
+        run(gate.post_tool_use(ptu("Bash", {"command": rm}, ""), "t2", None))
+        assert not gate.state.pending_verification, rm
+        run(gate.post_tool_use(ptu("Edit", {"file_path": "/p/app.cfg"}, "ok"), "t3", None))
+        run(gate.post_tool_use(ptu("Read", {"file_path": "/p/app.cfg"}, "a=1"), "t4", None))
+        assert run(gate.stop(STOP, None, None)) == {}, rm
+
+
+def test_grep_file_list_cannot_verify_but_content_mode_can():
+    files = ptu("Grep", {"pattern": "x", "path": "/p"}, "/p/app.cfg")
+    assert _edit_then(files)["decision"] == "block"
+    lines = ptu("Grep", {"pattern": "x", "path": "/p", "output_mode": "content"},
+                "/p/app.cfg:3:x=1")
+    assert _edit_then(lines) == {}
+
+
+def test_mcp_filesystem_tools_are_classified():
+    read = ptu("mcp__fs__read_text_file", {"path": "/p/app.cfg"}, "x=1")
+    assert _edit_then(read) == {}
+    listing = ptu("mcp__fs__list_directory", {"path": "/p"}, "[FILE] app.cfg")
+    assert _edit_then(listing)["decision"] == "block"
+    gate = GateHooks()
+    run(gate.post_tool_use(ptu("mcp__fs__write_file", {"path": "/p/a.cfg"}, "ok"),
+                           "t1", None))
+    assert gate.state.pending_verification == {"/p/a.cfg"}
+
+
+def test_relative_paths_resolve_against_session_cwd():
+    def event(tool, tool_input, out="ok"):
+        return dict(ptu(tool, tool_input, out), cwd="/srv/proj")
+    gate = GateHooks()
+    run(gate.post_tool_use(event("Edit", {"file_path": "/srv/proj/conf/app.cfg"}),
+                           "t1", None))
+    # from /srv/proj, a bare app.cfg is /srv/proj/app.cfg, not conf/app.cfg
+    run(gate.post_tool_use(event("Bash", {"command": "cat app.cfg"}, "x=1"), "t2", None))
+    assert run(gate.stop(STOP, None, None))["decision"] == "block"
+    run(gate.post_tool_use(event("Read", {"file_path": "conf/app.cfg"}, "x=2"),
+                           "t3", None))
+    assert run(gate.stop(STOP, None, None)) == {}
+
+
+def _gate_after(*events):
+    gate = GateHooks()
+    for i, ev in enumerate(events):
+        if ev is PROMPT:
+            run(gate.user_prompt_submit(PROMPT, None, None))
+        else:
+            run(gate.post_tool_use(ev, "t%d" % i, None))
+    return gate, run(gate.stop(STOP, None, None))
+
+
+def test_moved_file_is_owed_at_its_new_path():
+    edit = ptu("Edit", {"file_path": "/p/a.cfg"}, "ok")
+    for move in (ptu("Bash", {"command": "mv /p/a.cfg /p/b.cfg"}, ""),
+                 ptu("Bash", {"command": "git mv /p/a.cfg /p/b.cfg"}, ""),
+                 ptu("mcp__fs__move_file",
+                     {"source": "/p/a.cfg", "destination": "/p/b.cfg"}, "ok")):
+        gate, out = _gate_after(edit, move)
+        assert out["decision"] == "block" and "/p/b.cfg" in out["reason"], move
+        gate, out = _gate_after(edit, move,
+                                ptu("Read", {"file_path": "/p/b.cfg"}, "x=1"))
+        assert out == {}, move
+
+
+def test_removed_directory_clears_what_it_owed():
+    gate, out = _gate_after(
+        ptu("Edit", {"file_path": "/p/build/x.cfg"}, "ok"),
+        ptu("Bash", {"command": "rm -rf /p/build"}, ""),
+        ptu("Edit", {"file_path": "/p/app.cfg"}, "ok"),
+        ptu("Read", {"file_path": "/p/app.cfg"}, "a=1"))
+    assert out == {}
+
+
+def test_owed_rereads_reset_each_turn():
+    gate, out = _gate_after(
+        ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"), PROMPT,
+        ptu("Edit", {"file_path": "/p/b.cfg"}, "ok"),
+        ptu("Read", {"file_path": "/p/b.cfg"}, "b=1"))
+    assert out == {}
+    gate, out = _gate_after(
+        ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"),
+        ptu("Read", {"file_path": "/p/a.cfg"}, "a=1"), PROMPT,
+        ptu("Edit", {"file_path": "/p/b.cfg"}, "ok"))
+    assert out["decision"] == "block"
+
+
+def test_block_reason_names_the_files_still_owed():
+    gate, out = _gate_after(ptu("Edit", {"file_path": "/p/a.cfg"}, "ok"),
+                            ptu("Edit", {"file_path": "/p/b.cfg"}, "ok"),
+                            ptu("Read", {"file_path": "/p/a.cfg"}, "a=1"))
+    assert "/p/b.cfg" in out["reason"] and "/p/a.cfg" not in out["reason"]
+
+
 # ------------------------------------------------------- bare-python runner
 
 if __name__ == "__main__":

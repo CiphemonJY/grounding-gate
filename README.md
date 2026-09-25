@@ -75,9 +75,10 @@ state = GateState.for_model_class("default", claim_surface={"app.cfg"})
 state.current_step += 1
 obs = classify_observation(tool, args, result, state, read_only=not mutating)
 state.grounded_this_turn |= obs["grounds_assertion"]
-state.verified_this_turn |= obs["grounds_completion"]
+if obs["grounds_completion"] and state.cover_pending(tool, args, result):
+    state.verified_this_turn = True    # every file changed so far has been re-read
 if mutating:
-    state.last_mutation_step = state.current_step   # a completion now needs a read AFTER this
+    state.note_mutation(args)          # a completion now needs a read of THIS change
 
 # at every submit/conclude attempt — this must be the ONLY path to output:
 verdict = boundary_check({"claim_type": "completion", "content": answer}, state)
@@ -85,9 +86,17 @@ if verdict["verdict"] == "REJECT":
     ...  # surface verdict["legal_next"] to the model and continue the loop
 ```
 
-Note the mutation bookkeeping: without `last_mutation_step` ever being set, no
+Note the mutation bookkeeping: without `note_mutation` ever being called, no
 read can reach the verified tier and a `completion` can never be accepted —
-that is the gate working as designed, not a bug.
+that is the gate working as designed, not a bug. `note_mutation` records the
+step, drops earlier verification, adds what was changed to the claim surface,
+and marks each target it can identify (a `file_path`-style argument, or a
+surface entry named in free-text args) as owed a re-read; `cover_pending`
+settles those as reads arrive.
+
+Relevance matches paths by trailing components, so `app.cfg`, `./app.cfg`,
+`proj/app.cfg` and `/srv/proj/app.cfg` all name the same file, while
+`/etc/app.cfg` and `/srv/proj/app.cfg` stay distinct (so do URL paths).
 
 `turn_loop` in [boundary.py](https://github.com/CiphemonJY/grounding-gate/blob/main/src/grounding_gate/boundary.py)
 is the complete reference wiring (budget refill, mutation tracking, halt
@@ -128,16 +137,20 @@ Honest scope, from the design's leak audit:
   can misread a real result). That is punted to a declared verifier tier
   (`verify_with`), not smuggled into the floor.
 - **Relevance can be spoofed** by a model that deliberately mentions the right
-  identifiers in an irrelevant call. The floor defends against *lazy*
+  identifiers in an irrelevant call, and a claim's relevance to *symbols*
+  (not paths) is only as precise as the text: a note that mentions
+  `parse_config` grounds a claim about it as well as its source does. The floor defends against *lazy*
   ungroundedness, which is the overwhelmingly common failure; adversarial
   self-deception needs the verifier tier.
-- **The completion tier checks freshness, not coverage.** A completion needs
-  a novel, relevant observation taken after the last mutation — the gate
-  cannot prove that observation was *of the mutated item* when the claim
-  surface holds several identifiers (re-reading unchanged `a.cfg` after
-  editing `b.cfg` passes if both are on the surface). The adapter narrows
-  this by auto-adding mutated identifiers, but a broad user-seeded surface
-  keeps the coarseness. Tracking per-mutation coverage is future work.
+- **Completion coverage is only as good as target identification.** Each
+  change whose target the gate can name (a `file_path`-style argument, a
+  surface entry in free-text args, or a shell `> f`, `>> f`, `tee f`,
+  `sed -i ... f`) must be re-read after it happened (or deleted with `rm`;
+  a move carries the debt to the new path; owed re-reads reset each turn), so re-reading `a.cfg`
+  after editing `b.cfg` no longer passes. A change it can't name (a script,
+  `mv`, `python fix.py`) falls back to freshness: any novel, relevant read
+  after it counts. Treating those as owed would trap the agent on a target
+  no read could ever match.
 - **Nondeterministic tools defeat novelty unless you tell the gate about
   them.** The default `normalize()` strips the common timestamp shapes —
   ISO (second- or minute-precision), syslog and `ls -l` listings, RFC822/1123
@@ -266,8 +279,91 @@ message is shown to the *user*, not the model, and appears in headless runs
 only with `include_hook_events` enabled — the flag is the reliable marker.
 The gate never traps an agent.
 
+Tools are sorted by what their output can prove. `Read`/`NotebookRead` are
+*content* tools: they are relevant to the path they were given, not to names
+their text mentions. `Glob` is a *listing* tool: it can ground an assertion
+but never verify a change (it shows a file exists, not what it now says).
+Shell commands are parsed by `grounding_gate.shell`, a small quote- and
+heredoc-aware lexer (heredoc bodies are data, `>` inside quotes is text).
+`Bash` counts as mutating, except for a command built only from known
+read-only programs (`cat`, `head`, `grep`, `diff`, `git diff`, ...; no
+redirects, `tee` or `$(...)`), which is treated as a read of the files it
+operates on: `cat app.cfg` can verify an edit, `ls -l app.cfg` can only ground
+an assertion, and `echo app.cfg` or the pattern in `grep app.cfg notes.txt`
+counts for nothing. What counts is what reached the agent: the last stage
+of a pipeline must pass lines through (`cat app.cfg | grep x` shows content;
+`cat app.cfg | wc -l`, `head app.cfg > /dev/null` and `grep -q` do not).
+`sed` and `awk` count as reads when they can only print (`sed -n '1,40p'`,
+`awk 'NR<=20'`), as does `python -m json.tool FILE`. `cd` inside a command,
+subshells and the session's working directory (the hook's `cwd`) are
+followed, so `cd conf && cat app.cfg` reads `conf/app.cfg`, and `~/x`
+resolves to the agent's home directory (`GateHooks(home=...)` if the agent
+runs as another user). `git show
+HEAD:app.cfg` is the committed copy, not the edit; a bare `git diff` counts
+for the files in its `+++ b/` headers. `Grep` in its default
+`files_with_matches` (or `count`) mode is a listing. The reference MCP
+filesystem server's tools (`mcp__<server>__read_text_file`, `write_file`,
+`list_directory`, ...) are classified like their built-in counterparts.
+Symbols in content (`parse_config`, including the
+`load_settings` in `cfg.load_settings()`) still ground claims about them;
+file names a document merely mentions do not. Override with
+`content_tools=` / `listing_tools=`.
+
 The adapter adds no dependency: grounding-gate stays stdlib-only, and only
 `as_options_hooks()` requires `claude-agent-sdk` to be installed.
+
+## Measuring the error rate
+
+[examples/hallucination_bench.py](https://github.com/CiphemonJY/grounding-gate/blob/main/examples/hallucination_bench.py)
+drives labeled transcript families through `turn_loop` and the SDK adapter.
+Each family's correct verdict comes from what actually happened in the
+transcript (was the claimed file really read, after the change?), not from
+the gate's own fields. A wrong ACCEPT is a *leak* (a hallucinated claim got
+through) and a wrong REJECT is a *false reject* (honest work blocked). Each
+family runs over seeded variations: path spellings, how the surface is
+declared, noisy file contents.
+
+The design set was used to choose changes. Each held-out set was written
+after the previous round, measured before any change it motivated, and then
+retired into the design pool, so the newest set is the real generalization
+check. Structural error rate per set, 200 seeds per family:
+
+| Set | Families | Before (0.4.1) | After |
+|---|---|---|---|
+| design | 15 | 30.0% | 0.0% |
+| held-out 1 | 13 | 39.7% | 0.0% |
+| held-out 2 | 15 | 20.0% | 0.0% |
+| held-out 3 | 15 | 48.7% | 0.0% |
+| held-out 4 | 15 | 35.6% | 0.0% |
+| held-out 5 | 12 (+1 semantic) | 16.7% | 0.0% |
+| held-out 6 | 12 (+1 semantic) | 41.7% | 0.0% |
+| held-out 7 | 11 (+2 semantic) | 42.1% | 0.0% |
+| held-out 8 | 17 | 57.1% | 0.0% |
+| held-out 9 | 16 | 43.8% | 0.0% |
+| held-out 10 | 12 | 56.7% | 0.0% |
+| held-out 11 | 11 | 44.5% | 0.0% |
+| held-out 12 (newest) | 12 | 47.7% | 0.0% |
+| **all 180** | | **40.4%** | **0.0%** (1.1% with semantic pairs) |
+
+Fresh sets keep finding new gaps: sets 8-12 each scored 7-42% against the
+gate as it stood before they were written (Grep's file-list mode, `sed -n`
+views, `cd` in commands, `git show REV:path`, output piped into `wc`). Each
+gap was fixed in the round after it was found, so read "0.0%" as "every
+known scenario", not as a bound on the next new one.
+
+Four *semantic* families are reported but kept out of the structural rate.
+They come in pairs whose transcripts are identical and whose right answer
+depends only on what the claim says: reading a notes file that mentions
+`parse_config` does ground "the notes mention parse_config" but not "the
+function returns X", and a `Glob` hit grounds "settings.toml exists" but not
+"its port is 8080". The floor never sees the answer text, so any structural
+rule gets one of each pair wrong (both alternatives were tried and moved the
+error rather than removing it). That is the `verify_with` tier's job.
+
+CI runs `python examples/hallucination_bench.py --max-error 0.05` (fails if
+any set's structural rate exceeds 5%). The families encode this README's
+semantics, so 0% means "no known structural failure mode", not "no failure
+mode". The limits above still apply.
 
 ## Preset tuning
 
