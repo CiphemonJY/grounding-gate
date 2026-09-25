@@ -15,8 +15,8 @@
   answer but never verify a change. Checked by `tests/test_strict_reads.py`
   (every leak from the three reviews rejected; a property test against an
   independent oracle of the rule) and by the benchmark (0 leaking families;
-  it blocks 47% of the benchmark's honest transcripts, which verify through
-  shell or search).
+  it blocks about half of the benchmark's honest transcripts, which verify
+  through shell or search).
 - Strict reads was then reviewed adversarially (14 leak classes, 5 traps,
   0 crashes; all reproduced, fixed and pinned in
   `tests/test_strict_reads.py`): unclassified tools block verification
@@ -28,6 +28,38 @@
   `&`, `mv -n`); an ambiguous `cp a b`/`mv t out` may be paid at either
   place. Three fuzzers with independent oracles now find 0 leaks in
   146,567 random sessions.
+- A second adversarial review of strict reads found 13 more leak classes
+  (0 traps beyond the declared costs, 0 crashes); all are fixed and pinned
+  in `tests/test_strict_reads.py`:
+  - A program whose writes the parser doesn't model (`xargs`, `find -exec`,
+    `bash -c`, `eval`, `git checkout f`, `git apply`/`pull`/`reset`,
+    `tar -x`, `ln`, formatters, scripts) now blocks verification, unless
+    it is declared in the new `strict_trusted_programs` (e.g. `"pytest"`,
+    `"npm test"`).
+  - `timeout`, `nice`, `stdbuf`, `ionice` are seen through (in both modes).
+  - sed backups (`-i.bak`, `-ie`, `--in-place=.orig`), sed's `w`/`e`
+    commands, brace expansion, `[x]` globs and curl's cookie/header files
+    are owed.
+  - A `&&` stage counts as run only in the command's last list, and a
+    failed command relaxes nothing.
+  - A subagent's commands are placed in its own directory; a turn where
+    only a subagent acted is gated; a subagent's read never verifies.
+  - Writes by untrusted MCP servers block; an MCP read verifies only with
+    an absolute path, one file, on a server named unambiguously.
+  - A failed write owes its target.
+  - A background command stays owed across turns until `BashOutput`
+    reports it finished or `KillShell` stops it.
+  - `NotebookRead` of one cell is partial, and a `Read` with extra path
+    keys doesn't verify.
+  - A `case` pattern's `)` no longer ends a subshell, and a `cd` inside a
+    piped group, loop or branch no longer pins the directory.
+  - An MCP move destination with no cwd can't be paid.
+  - A Bash whose hook `cwd` differs from the previous one is placed at
+    both directories.
+
+  The benchmark still shows 0 strict leaks. Strict mode blocks 51.0% of
+  honest transcripts, or 49.6% with `pytest` declared. The four fuzzers
+  find 0 leaks in 240,000 more sessions.
 - Both modes: MCP `move_file` owes its destination; `create_directory`
   owes nothing; `git checkout -- f`, `git restore f`, `truncate`, `dd of=`,
   `sponge`, `curl -o`, `wget -O`, `install`, `rsync`, `ruby -i`, and

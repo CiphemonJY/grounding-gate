@@ -100,7 +100,7 @@ class GateState:
         return cls(budget=cap, cap=cap, refill=refill, **kw)
 
     def note_mutation(self, args, cwd="", output="", failed=False, home=None,
-                      strict=False):
+                      strict=False, trusted_programs=()):
         """Record a mutating call at ``current_step``.
 
         A completion now needs a fresh read AFTER this step, earlier
@@ -118,6 +118,15 @@ class GateState:
         self.verified_this_turn = False
         command = args.get("command") if isinstance(args, dict) else None
         if not isinstance(command, str):
+            if failed and strict:
+                # it may have written part of its target: owe what it names
+                targets = {t if t.startswith("/") else UNPLACED + t
+                           for t in path_values(args)} or {UNPLACED + "unnamed target"}
+                for t in targets:
+                    self._owe(t, None)
+                self.changed_this_turn |= targets
+                self.claim_surface |= mutation_identifiers(args)
+                return
             if failed:
                 # it may have partly happened, so a read of it is relevant
                 # (and required: verification was just reset), but it isn't
@@ -138,6 +147,8 @@ class GateState:
             self.claim_surface |= mutation_identifiers(args)
             if moved:
                 src, dst = _under(cwd, src), _under(cwd, dst)
+                if strict and not dst.startswith("/"):
+                    dst = UNPLACED + dst          # no cwd: can't be placed
                 if not strict:
                     self._move(src, dst, None)
                 # the destination now holds content that wasn't read there
@@ -148,7 +159,7 @@ class GateState:
         from . import shell
         effs = shell.effects(command, cwd, output, home, strict)
         if strict:
-            self._note_shell_strictly(effs)
+            self._note_shell_strictly(effs, failed, trusted_programs)
             return
         if effs is None:
             return                     # unparseable: freshness still applies
@@ -190,7 +201,7 @@ class GateState:
             self.verified_this_turn = True
             self.last_verification_step = self.current_step
 
-    def _note_shell_strictly(self, effs):
+    def _note_shell_strictly(self, effs, failed=False, trusted_programs=()):
         """Strict reads: the shell parser may ADD obligations, never relax
         one.
 
@@ -202,7 +213,11 @@ class GateState:
         moved or deleted by a later part of it that certainly ran (no
         ``||``, ``if`` or ``&``, no ``mv -n``), which is the temp-file idiom
         (``jq ... > tmp && mv tmp f``). Nothing it printed counts as a read.
-        An unparseable command owes an unpayable entry.
+        A program whose writes the parser doesn't model (a script, a
+        build, ``xargs``, ``git checkout``) owes an unpayable entry unless
+        ``trusted_programs`` declares it (``"pytest"``, ``"npm test"``). A
+        failed command may have stopped anywhere: nothing is relaxed. An
+        unparseable command owes an unpayable entry.
         """
         from . import shell
         self.pending_verification |= self.changed_this_turn
@@ -211,7 +226,12 @@ class GateState:
         created = {}                 # path -> alias, files new in this command
         for eff in effs:
             kind = eff[0]
-            if kind == "write":
+            if kind == "opaque":
+                if not _trusted(eff[1], trusted_programs):
+                    self._owe(shell.UNPLACED + "unmodelled command %s (declare it "
+                              "in strict_trusted_programs if it writes no files)"
+                              % " ".join(eff[1][:2]), None)
+            elif kind == "write":
                 path, alt, how = eff[1], eff[2], eff[3]
                 if not path.startswith("/") and not path.startswith(shell.UNPLACED):
                     path = shell.UNPLACED + path      # no cwd: can't be placed
@@ -225,6 +245,12 @@ class GateState:
                         self._owe(place, None)
                         if place not in self.changed_this_turn:
                             created[place] = None
+            elif failed and kind == "move":
+                self._owe(eff[2], eff[3] if eff[3] != "*glob*" else None)
+                if eff[3] == "*glob*":
+                    self._owe(shell.UNPLACED + "files moved by a failed command", None)
+            elif failed:
+                continue           # a remove may not have run: relax nothing
             elif kind == "remove" and eff[3]:
                 for e in _removed({eff[1]}, set(created), eff[2]):
                     self._drop(e)
@@ -594,6 +620,16 @@ def mutation_targets(args, surface, cwd=""):
     if isinstance(args, (list, tuple)):
         return {t for a in args for t in mutation_targets(a, surface, cwd)}
     return set()
+
+
+def _trusted(argv, trusted_programs):
+    """Whether ``argv`` starts with one of the declared programs (each a
+    name, or a name and its leading words: ``"npm test"``)."""
+    for entry in trusted_programs:
+        words = tuple(entry.split())
+        if words and tuple(argv[:len(words)]) == words:
+            return True
+    return False
 
 
 def _under(cwd, path):

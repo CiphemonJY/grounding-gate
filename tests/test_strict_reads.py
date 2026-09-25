@@ -36,8 +36,9 @@ def ptu(tool, tool_input, response="ok", cwd="/p"):
             "tool_input": tool_input, "tool_response": response, "cwd": cwd}
 
 
-def strict(*steps, cwd="/p", surface=()):
-    gate = GateHooks(claim_surface=set(surface), home="/home/u", strict_reads=True)
+def strict(*steps, cwd="/p", surface=(), trusted=("pytest", "npm test")):
+    gate = GateHooks(claim_surface=set(surface), home="/home/u", strict_reads=True,
+                     strict_trusted_programs=trusted)
     for step in steps:
         if step == "PROMPT":
             drive(gate.user_prompt_submit(PROMPT, None, None))
@@ -94,6 +95,11 @@ def test_any_shell_command_reowes_this_turns_changes():
     assert verdict == "REJECT" and A in gate.state.pending_verification
     assert "strict reads" in out["reason"]
     assert strict(E(A), R(A), B("pytest -q", "3 passed"), R(A, "x=2"))[0] == "ACCEPT"
+    # undeclared, a test run may have written anything: unpayable
+    verdict, gate, _ = strict(E(A), R(A), B("pytest -q", "3 passed"), R(A, "x=2"),
+                              trusted=())
+    assert verdict == "REJECT" and any("unmodelled command pytest" in e
+                                       for e in gate.state.pending_verification)
     # even an apparently read-only command: strict mode trusts no parse
     assert strict(E(A), R(A), B("git status", " M a.cfg"))[0] == "REJECT"
 
@@ -155,10 +161,15 @@ def _ev(tool, tool_input, response="ok", cwd="/p", **extra):
     return event
 
 
-def strict_events(*events, surface=()):
-    gate = GateHooks(claim_surface=set(surface), home="/home/u", strict_reads=True)
+def strict_events(*events, surface=(), **options):
+    gate = GateHooks(claim_surface=set(surface), home="/home/u", strict_reads=True,
+                     **options)
     for e in events:
-        if e["hook_event_name"] == "PostToolUse":
+        if e == "PROMPT":
+            drive(gate.user_prompt_submit(PROMPT, None, None))
+        elif e == "STOP":
+            drive(gate.stop(STOP, None, None))
+        elif e["hook_event_name"] == "PostToolUse":
             drive(gate.post_tool_use(e, None, None))
         else:
             drive(gate.post_tool_use_failure(e, None, None))
@@ -176,6 +187,13 @@ def _E(p):
 
 def _R(p, text="c", **extra):
     return _ev("Read", dict({"file_path": p}, **extra), text)
+
+
+def _fail(tool, tool_input, cwd="/p", **extra):
+    event = {"hook_event_name": "PostToolUseFailure", "tool_name": tool,
+             "tool_input": tool_input, "error": "exit 1", "cwd": cwd}
+    event.update(extra)
+    return event
 
 
 STRICT_LEAKS = {
@@ -230,12 +248,158 @@ STRICT_TRAPS = {
     "T3 created temp file deleted": (
         _bash("echo '{}' > req.json && curl -d @req.json localhost && rm req.json"),
         _E("/p/x.py"), _R("/p/x.py")),
+    "T4 loops, case and builtins": (
+        _bash("set -e; for f in a b; do echo $f; done; case $1 in x) true;; esac"),
+        _E("/p/x.py"), _R("/p/x.py")),
+    "T5 wrapped reader": (_bash("timeout 5 cat a.cfg"), _E("/p/x.py"), _R("/p/x.py")),
+    "T6 failed Edit, then a read": (_fail("Edit", {"file_path": "/p/a.cfg"}),
+                                    _R("/p/a.cfg")),
+}
+
+
+def _wrote_b(cmd):
+    """A command that changes /p/b.cfg, then a read of another file."""
+    return (_E("/p/a.cfg"), _bash(cmd), _R("/p/a.cfg"))
+
+
+# second strict review: each wrote a file no read covered, yet was accepted
+STRICT_LEAKS_2 = {
+    # 1a: a known writer run by another program
+    "xargs sed": _wrote_b("grep -rl foo . | xargs sed -i s/foo/bar/g"),
+    "find -exec": _wrote_b("find . -name '*.cfg' -exec sed -i s/a/b/ {} +"),
+    "bash -c": _wrote_b("bash -c 'sed -i s/1/2/ b.cfg'"),
+    "sh -c": _wrote_b("sh -c \"echo x > b.cfg\""),
+    "eval": _wrote_b("eval 'echo x > b.cfg'"),
+    "bash heredoc": _wrote_b("bash <<'EOF'\nsed -i s/1/2/ b.cfg\nEOF"),
+    "timeout": _wrote_b("timeout 5 sed -i s/1/2/ b.cfg"),
+    "nice": _wrote_b("nice -n 5 sed -i s/1/2/ b.cfg"),
+    "stdbuf": _wrote_b("stdbuf -oL sed -i s/1/2/ b.cfg"),
+    "sudo -u": _wrote_b("sudo -u www sed -i s/1/2/ b.cfg"),
+    "env -i": _wrote_b("env -i sed -i s/1/2/ b.cfg"),
+    "env -S": _wrote_b("env -S 'sed -i s/1/2/ b.cfg'"),
+    "busybox path": _wrote_b("/bin/busybox sed -i s/1/2/ b.cfg"),
+    # 1b: programs that write by design
+    "git checkout f": _wrote_b("git checkout b.cfg"),
+    "git checkout rev f": _wrote_b("git checkout HEAD~1 b.cfg"),
+    "git apply": _wrote_b("git apply fix.patch"),
+    "git stash pop": _wrote_b("git stash pop"),
+    "git reset --hard": _wrote_b("git reset --hard HEAD~1"),
+    "git pull": _wrote_b("git pull"),
+    "tar -x": _wrote_b("tar -xzf conf.tgz"),
+    "unzip": _wrote_b("unzip -o conf.zip"),
+    "gunzip": _wrote_b("gunzip b.cfg.gz"),
+    "ln -sf": _wrote_b("ln -sf other.cfg b.cfg"),
+    "uniq out": _wrote_b("uniq a.txt b.cfg"),
+    "json.tool out": _wrote_b("python -m json.tool a.json b.cfg"),
+    "awk print >": _wrote_b("awk '{print > \"b.cfg\"}' a.txt"),
+    "sed w": _wrote_b("sed -n '/x/w b.cfg' a.txt"),
+    "sed s///w": _wrote_b("sed 's/x/y/w b.cfg' a.txt"),
+    "formatter": _wrote_b("black ."),
+    "substituted script": _wrote_b("x=$(python fix.py)"),
+    # 1c: backups and brace expansion
+    "sed -i.bak": _wrote_b("sed -i.bak s/1/2/ b"),
+    "sed -ie": _wrote_b("sed -ie s/1/2/ b.cf"),
+    "sed --in-place=": _wrote_b("sed --in-place=.cfg s/1/2/ b"),
+    "cp braces": _wrote_b("cp b.cfg{,.bak}"),
+    "bracket glob": (_E("/p/a.cfg"), _bash("sed -i s/1/2/ [b].cfg"),
+                     _R("/p/[b].cfg"), _R("/p/a.cfg")),
+    # 2: a subagent's shell runs in its own directory
+    "subagent cwd": (_E("/p/a.cfg"), _R("/p/a.cfg"),
+                     _bash("sed -i s/a/b/ a.cfg", "/p/wt", agent_id="s1"),
+                     _R("/p/a.cfg")),
+    # 3: only a subagent acted this turn
+    "subagent-only turn": ("PROMPT", _ev("Edit", {"file_path": "/p/a.cfg"},
+                                         agent_id="s1")),
+    # 4: a temp file left behind when the chain stopped
+    "failed && temp": (_fail("Bash", {"command": "jq . p.json > tmp.json && "
+                                                 "mv tmp.json p.json"}),
+                       _R("/p/p.json")),
+    "&& then ; temp": (_bash("jq . p.json > tmp.json && mv tmp.json p.json; echo ok"),
+                       _R("/p/p.json")),
+    # 5, 6, 12: MCP servers
+    "untrusted MCP write": (_ev("mcp__docker__write_file", {"path": "/etc/app.cfg"}),
+                            _R("/etc/app.cfg")),
+    "relative MCP read": (_ev("Edit", {"file_path": "/p/sub/a.cfg"}, cwd="/p/sub"),
+                          _ev("mcp__fs__read_file", {"path": "a.cfg"}, "t", "/p/sub")),
+    "server name with __": (_E("/p/a.cfg"),
+                            _ev("mcp__fs__remote__read_file", {"path": "/p/a.cfg"}, "x")),
+    # 7: another notebook cell
+    "NotebookRead cell": (
+        _ev("NotebookEdit", {"notebook_path": "/p/n.ipynb", "cell_id": "c1"}),
+        _ev("NotebookRead", {"notebook_path": "/p/n.ipynb", "cell_id": "c2"}, "c2")),
+    # 8: a failed write may have written part of its file
+    "failed Write": (_E("/p/a.cfg"), _R("/p/a.cfg"),
+                     _fail("Write", {"file_path": "/p/b.cfg"}), _R("/p/a.cfg")),
+    "failed MCP edit": (_E("/p/a.cfg"), _R("/p/a.cfg"),
+                        _fail("mcp__fs__edit_file", {"path": "/p/c.cfg"}), _R("/p/a.cfg")),
+    # 9: a background command still running into the next turn
+    "background across turns": (
+        _E("/p/a.cfg"), _R("/p/a.cfg"),
+        _bash("sleep 5; sed -i s/1/2/ b.cfg", run_in_background=True),
+        "STOP", "STOP", "STOP", "STOP", "PROMPT", _R("/p/a.cfg")),
+    # 10: a Read names one file; other path keys don't make it a read of them
+    "extra path key": (_E("/p/a.cfg"),
+                       _ev("Read", {"file_path": "/p/x", "path": "/p/a.cfg"}, "x")),
+    # 11: a case pattern's `)` inside a subshell
+    "case in subshell": (_E("/p/x.py"),
+                         _bash("(cd sub && case x in x) sed -i s/1/2/ c.cfg;; esac)"),
+                         _R("/p/c.cfg"), _R("/p/x.py")),
+    # 13: an MCP move with no cwd
+    "MCP move, no cwd": (_ev("mcp__fs__move_file", {"source": "x", "destination": "Makefile"},
+                             cwd=None), _R("/q/Makefile")),
+    # 14: the hook may report the directory the command ended in
+    "cd at the end": (_E("/p/x.py"), _R("/p/x.py"),
+                      _bash("sed -i s/1/2/ package.json && cd pkg", "/p/pkg"),
+                      _R("/p/pkg/package.json"), _R("/p/x.py")),
+    # a piped group, and a loop that may not run, leave the directory alone
+    "piped group cd": (_E("/p/x.py"), _bash("{ cd sub && true; } | cat; echo x > b.cfg"),
+                       _R("/p/sub/b.cfg"), _R("/p/x.py")),
+    "loop cd": (_E("/p/x.py"), _bash("for d in $L; do cd sub && true; done; echo x > b.cfg"),
+                _R("/p/sub/b.cfg"), _R("/p/x.py")),
+    # opt-in subagent gating: a subagent's read isn't the agent's
+    "gated subagent read": (_E("/p/a.cfg"),
+                            _ev("Read", {"file_path": "/p/a.cfg"}, "c", agent_id="s1")),
 }
 
 
 def test_strict_review_leaks_are_rejected():
     for name, events in STRICT_LEAKS.items():
         assert strict_events(*events) == "REJECT", name
+    for name, events in STRICT_LEAKS_2.items():
+        options = {"gate_subagents": True} if name == "gated subagent read" else {}
+        assert strict_events(*events, **options) == "REJECT", name
+
+
+def test_declared_programs_run_free():
+    events = (_E("/p/a.cfg"), _bash("pytest -q && npm test -- --ci"), _R("/p/a.cfg"))
+    assert strict_events(*events) == "REJECT"
+    assert strict_events(*events, strict_trusted_programs=("pytest", "npm test")) \
+        == "ACCEPT"
+    # a declared program's redirects are still owed; `npm` alone isn't `npm test`
+    assert strict_events(_E("/p/a.cfg"), _bash("pytest > log"), _R("/p/a.cfg"),
+                         strict_trusted_programs=("pytest",)) == "REJECT"
+    assert strict_events(_E("/p/a.cfg"), _bash("npm run fix"), _R("/p/a.cfg"),
+                         strict_trusted_programs=("npm test",)) == "REJECT"
+
+
+def test_a_finished_background_command_is_owed_then_paid():
+    start = _bash("sleep 5; sed -i s/1/2/ b.cfg", run_in_background=True)
+    start["tool_response"]["backgroundTaskId"] = "bg1"
+    running = _ev("BashOutput", {"bash_id": "bg1"}, {"status": "running"})
+    done = _ev("BashOutput", {"bash_id": "bg1"}, {"status": "completed"})
+    assert strict_events(start, running, _R("/p/b.cfg")) == "REJECT"
+    assert strict_events(start, done, _R("/p/b.cfg")) == "ACCEPT"
+    killed = _ev("KillShell", {"shell_id": "bg1"}, "killed")
+    assert strict_events(start, killed, _R("/p/b.cfg")) == "ACCEPT"
+    # a background command that writes nothing owes nothing
+    assert strict_events(_bash("pytest", run_in_background=True), _E("/p/a.cfg"),
+                         _R("/p/a.cfg"), strict_trusted_programs=("pytest",)) == "ACCEPT"
+
+
+def test_a_tool_free_turn_stays_exempt():
+    gate = GateHooks(home="/home/u", strict_reads=True)
+    drive(gate.user_prompt_submit(PROMPT, None, None))
+    assert drive(gate.stop(STOP, None, None)) == {}
 
 
 def test_strict_review_traps_are_accepted():

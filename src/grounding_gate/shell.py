@@ -306,6 +306,7 @@ _PREFIXES = frozenset({"sudo", "time", "command", "nohup", "env", "builtin",
                        "if", "then", "else", "elif", "do", "while", "until",
                        "!", "{"})
 _CLOSERS = frozenset({"}", "fi", "done", "esac"})
+_OPENERS = frozenset({"{", "if", "while", "until"})
 _CONDITIONAL = re.compile(r"(?:^|[;&|\n(]\s*)(?:if|while|until|case|for|select)\s")
 
 
@@ -352,13 +353,14 @@ def parse(command, cwd="", home=None):
     except ValueError:
         return None
     base = posixpath.normpath(cwd) if cwd else ("" if cwd == "" else None)
-    stages, saved, dirstack = Stages(), [], []
+    stages, saved, dirstack, groups = Stages(), [], [], []
     base_alt = None
     # `||`, `if`/`while`/`case` or a background job anywhere makes every
     # stage's running uncertain: a successful call no longer proves it ran
     conditional = "||" in command or bool(_CONDITIONAL.search(command))
     argv, redirects, subst = [], [], False
     expect_target, piped_in, just_closed = None, False, False
+    in_pattern = False          # reading a case pattern (`x)`), not a command
 
     def flush(sep):
         nonlocal argv, redirects, subst, base, piped_in, base_alt
@@ -366,9 +368,22 @@ def parse(command, cwd="", home=None):
         if argv and argv[0] in _CLOSERS and (piped or redirects):
             stages.grouped_output = True
         words = argv
+        opened = []
         while words and (_ASSIGNMENT.match(words[0]) or words[0] in _PREFIXES):
+            if words[0] in ("sudo", "env", "command") and len(words) > 1 \
+                    and words[1].startswith("-"):
+                break            # `sudo -u www ...`: options we can't read
+            if words[0] in _OPENERS:
+                opened.append(words[0])
             words = words[1:]
+        if words and words[0] in ("for", "select", "case"):
+            opened.append(words[0])
+        for kind in opened:
+            groups.append((base, base_alt, kind))
+        closed = sum(1 for w in words if w in _CLOSERS)
         words = [w for w in words if w not in _CLOSERS]
+        if words[:1] == ["case"]:
+            words = []                  # `case WORD in` runs nothing
         if words or redirects or subst:
             stage = Stage(list(words), redirects, subst, piped, piped_in,
                           base, home, sep, base_alt)
@@ -389,6 +404,15 @@ def parse(command, cwd="", home=None):
                 # only `cd x && ...` pins where it runs
                 base_alt = None if sep == "&&" else base
                 base = new
+        for _ in range(closed):
+            if groups:
+                outer_base, outer_alt, kind = groups.pop()
+                if piped:
+                    # a piped group ran in a subshell: its cd ended with it
+                    base, base_alt = outer_base, outer_alt
+                elif kind != "{" and base != outer_base and base_alt is None:
+                    # a loop may run no times, a branch may not be taken
+                    base_alt = outer_base
         piped_in = piped
         argv, redirects, subst = [], [], False
 
@@ -403,9 +427,19 @@ def parse(command, cwd="", home=None):
                 redirects.append((fd, op, str(value)))
                 subst = subst or value.subst
                 continue
-        if kind == "word":
+        if kind == "word" and in_pattern and value == "esac":
+            in_pattern = False
+            argv.append(value)
+        elif kind == "word":
             argv.append(value)
             subst = subst or value.subst
+            if value == "in" and argv[:1] == ["case"] and len(argv) == 3:
+                in_pattern = True
+        elif in_pattern and value == "(" and not argv:
+            continue                     # `(x)` pattern form
+        elif in_pattern and value == ")":
+            # the end of a case pattern: the words before it were the pattern
+            argv, redirects, subst, in_pattern = [], [], False, False
         elif kind == "redir":
             expect_target = value
         elif value == "(":
@@ -417,8 +451,23 @@ def parse(command, cwd="", home=None):
                 base, base_alt = saved.pop()
             just_closed = True
         else:                                    # | |& ; && || & ;;
+            if value in (";;", ";&", ";;&"):
+                in_pattern = True
             flush(value)
     flush(";")
+    # a stage after `&&` ran only if everything before it in its list
+    # succeeded; the exit status is the LAST list's, so a successful call
+    # proves that only for the last list (`a > t && mv t f; echo` doesn't)
+    last_list = len(stages) - 1
+    while last_list > 0 and stages[last_list - 1].sep in ("&&", "|", "|&"):
+        last_list -= 1
+    guarded = False
+    for k, stage in enumerate(stages):
+        if k and stages[k - 1].sep not in ("&&", "|", "|&"):
+            guarded = False                      # a new list
+        if guarded and k < last_list:
+            stage.certain = False
+        guarded = guarded or stage.sep == "&&"
     return stages
 
 
@@ -495,11 +544,50 @@ _ALIASES = {"gsed": "sed", "gawk": "awk", "mawk": "awk", "nawk": "awk",
             "grm": "rm", "python3": "python3"}
 
 
+# programs that run the rest of their argv as a command: (options that take
+# a value, number of fixed operands before the command)
+_WRAPPERS = {
+    "timeout": ({"-s", "--signal", "-k", "--kill-after"}, 1),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "stdbuf": ({"-i", "-o", "-e", "--input", "--output", "--error"}, 0),
+    "ionice": ({"-c", "-n", "-p", "--class", "--classdata"}, 0),
+    "nohup": (set(), 0), "time": (set(), 0), "command": (set(), 0),
+}
+
+
+def _unwrap(name, args):
+    """The command a wrapper runs (``timeout 5 sed ...`` runs ``sed ...``),
+    or None when its options can't be read (the stage then stays opaque)."""
+    takes_value, fixed = _WRAPPERS[name]
+    k = 0
+    while k < len(args) and args[k].startswith("-") and args[k] != "-":
+        a = args[k]
+        if a == "--":
+            k += 1
+            break
+        if name == "command" and a != "-p":
+            return None                    # -v/-V describe, they don't run
+        if name == "nice" and re.match(r"^-\d+$", a):
+            k += 1
+            continue
+        if a in takes_value:
+            k += 2
+            continue
+        if "=" in a or name in ("timeout", "time", "nohup", "command") or (
+                name == "stdbuf" and len(a) > 2) or (
+                name in ("nice", "ionice") and len(a) > 2 and a[2:].isdigit()):
+            k += 1
+            continue
+        return None
+    k += fixed
+    return args[k:] if k < len(args) else None
+
+
 def _program(stage):
     """``(name, args, cwd)``; git subcommands are named ``git diff`` etc.,
     with global options skipped (``-C DIR`` moves the base)."""
     argv, cwd = stage.argv, stage.cwd
-    if argv and argv[0] == "busybox":
+    if argv and posixpath.basename(argv[0]) == "busybox":
         argv = argv[1:]
     if not argv:
         return "", [], cwd
@@ -508,6 +596,12 @@ def _program(stage):
     base = _ALIASES.get(base, base)
     if base != argv[0]:
         argv = [base] + list(argv[1:])
+    if base in _WRAPPERS:
+        inner = _unwrap(base, list(argv[1:]))
+        if inner:
+            return _program(Stage(inner, stage.redirects, stage.subst, stage.piped,
+                                  stage.piped_in, cwd, stage.home, stage.sep,
+                                  stage.cwd_alt))
     if argv[0] == "git":
         k = 1
         while k < len(argv) and argv[k].startswith("-"):
@@ -604,6 +698,31 @@ def _sed_parts(args):
     if not has_e and files:
         scripts.append(files.pop(0))
     return in_place, scripts, files
+
+
+# sed's w/W commands and s///w flag write a file; e runs a command
+_SED_WRITES = re.compile(r"(?:^|[^A-Za-z0-9_\\])[gpIiMm0-9]*[wWe](?:\s|$)")
+
+
+def _sed_backup(args):
+    """The backup suffix of an in-place sed (``-i.bak``, ``-ie`` whose
+    suffix is ``e``, ``--in-place=.orig``, BSD ``-i .bak``), else None."""
+    for k, a in enumerate(args):
+        if a.startswith("--in-place="):
+            return a.split("=", 1)[1] or None
+        if a.startswith("-") and not a.startswith("--") and "i" in a[1:]:
+            rest = a[a.index("i", 1) + 1:]
+            if rest:
+                return rest
+            if a == "-i" and k + 1 < len(args):
+                nxt = args[k + 1]
+                following = [x for x in args[k + 2:] if not x.startswith("-")]
+                has_e = any(x in ("-e", "--expression", "-f", "--file")
+                            or x.startswith("--expression=") for x in args)
+                if re.match(r"^\.[\w.-]{1,16}$", nxt) and \
+                        len(following) >= (1 if has_e else 2):
+                    return nxt
+    return None
 
 
 def _awk_parts(args):
@@ -1031,9 +1150,17 @@ def _writes(stage, strict=False):
     if name == "tee":
         out += _split_args("tee", args)[1]
     elif name == "sed":
-        in_place, _, files = _sed_parts(args)
+        in_place, scripts, files = _sed_parts(args)
         if in_place:
             out += files
+            suffix = _sed_backup(args) if strict else None
+            if suffix and "*" in suffix:
+                unplaced.append("sed backup " + suffix)
+            elif suffix:
+                out += [f + suffix for f in files]
+        if not _is_viewer(name, args) and any(
+                s is None or _SED_WRITES.search(s) for s in scripts):
+            unplaced.append("sed script that writes or runs commands")
     elif name == "sort":
         out += _sort_outputs(args)
     elif name == "awk" and _awk_in_place(args):
@@ -1053,6 +1180,12 @@ def _writes(stage, strict=False):
                (a.startswith("-") and not a.startswith("--") and "O" in a[1:])
                for a in args):
             unplaced.append("curl -O")
+        if strict:
+            out += _option_values(args, _CURL_FILE_OPTS)
+            if any(a.split("=", 1)[0] in ("-K", "--config", "--output-dir")
+                   or re.match(r"^-[A-Za-z]{2,}$", a) and set(a[1:]) & set("oDcK")
+                   for a in args):
+                unplaced.append("curl options")
     elif name == "wget":
         named = _option_values(args, ("-O", "--output-document"))
         out += named
@@ -1073,7 +1206,7 @@ def _writes(stage, strict=False):
     for p in out:
         if _harmless_target(">", p):
             continue
-        if set(p) & set("*?"):
+        if set(p) & set("*?["):
             placed.append((UNPLACED + p, None, None))      # a glob: which files?
             continue
         r = resolve(p, cwd, stage.home)
@@ -1091,6 +1224,12 @@ def _writes(stage, strict=False):
         placed += [(d, a, "dir") for d, a in _copy_targets(name, args, cwd, stage.home)]
     placed += [(UNPLACED + u, None, None) for u in unplaced]
     return placed
+
+
+# curl options that write a file of their own (headers, cookies, traces)
+_CURL_FILE_OPTS = ("-D", "--dump-header", "-c", "--cookie-jar", "--trace",
+                   "--trace-ascii", "--libcurl", "--stderr", "--etag-save",
+                   "--hsts", "--alt-svc")
 
 
 def _option_values(args, names):
@@ -1283,6 +1422,34 @@ def _substitutions(stage, process=True):
     return out
 
 
+def _known_program(stage):
+    """Whether everything the stage's program itself writes is modelled
+    (redirects and substitutions are parsed separately): a read-only
+    program, a known writer, or a builtin that writes nothing."""
+    name, args, _ = _program(stage)
+    if not name:
+        return True
+    if name == "exec":
+        return not args                  # `exec 3>f` only redirects
+    if name == "command":
+        return args[:1] in (["-v"], ["-V"])    # describes, runs nothing
+    if name in _NO_WRITES or name in _KNOWN_EFFECTS or name in ("curl", "wget"):
+        return True             # (their file options are parsed by _writes)
+    if _writes_via_option(name, args):
+        return False
+    if name.startswith("git "):
+        return name[4:] in _READ_ONLY_GIT
+    if name in ("awk", "json.tool"):
+        return _is_viewer(name, args)
+    if name == "find":
+        return not any(a in _FIND_ACTIONS for a in args)
+    return name in _READ_ONLY
+
+
+_FIND_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete",
+                           "-fprint", "-fprint0", "-fprintf", "-fls"})
+
+
 def _inner_writes(stage, cwd, home, strict=False, depth=0):
     """Files written by commands inside a stage's substitutions (``x=$(sed
     -i ... f)``). Their output was captured, not shown, so only their writes
@@ -1296,10 +1463,23 @@ def _inner_writes(stage, cwd, home, strict=False, depth=0):
         inner = parse(text, cwd, home)
         for s in inner or ():
             found += _writes(s, strict)
+            if strict and not _known_program(s):
+                name = _program(s)[0]
+                found.append((UNPLACED + "substituted command " + name, None, None))
             if s.subst:
                 found += _inner_writes(s, cwd, home, strict, depth + 1)
     return found
 
+
+# builtins and programs that change no file themselves (their redirects are
+# still parsed); loop and case headers only name words
+_NO_WRITES = frozenset({
+    "true", "false", ":", "export", "unset", "set", "shift", "local", "declare",
+    "typeset", "readonly", "exit", "return", "break", "continue", "sleep",
+    "wait", "read", "for", "select", "case", "in", "shopt", "trap", "alias",
+    "unalias", "hash", "type", "umask", "ulimit", "jobs", "kill", "exec",
+    "git add", "git fetch"})
+_BRACES = re.compile(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}")
 
 _KNOWN_EFFECTS = frozenset({"tee", "sed", "mv", "git mv", "rm", "git rm",
                             "unlink", "rmdir", "mkdir", "touch", "cp", "sort",
@@ -1312,7 +1492,7 @@ def effects(command, cwd="", output="", home=None, strict=False):
     """Ordered effects of a (possibly mutating) command:
     ``("write", path, alt, kind)``, ``("move", src, dst, alt, certain)``,
     ``("remove", path, recursive, certain)``, ``("read", path)`` for content a stage
-    showed the agent, and ``("opaque",)`` for a stage whose writes can't be
+    showed the agent, and ``("opaque", argv)`` for a stage whose writes can't be
     known (a script, a build, a substitution). None when the command can't
     be parsed."""
     stages = parse(command, cwd, home)
@@ -1326,10 +1506,12 @@ def effects(command, cwd="", output="", home=None, strict=False):
         reads = set()
         for j, stage in enumerate(pipe):
             name, args, _ = _program(stage)
-            known = _stage_read_only(stage) or (name in _KNOWN_EFFECTS
-                                                and not stage.subst)
-            if not known:
-                out.append(("opaque",))
+            if not _known_program(stage):
+                out.append(("opaque", tuple(name.split()) + tuple(args)))
+            if strict and not _stage_read_only(stage) and any(
+                    _BRACES.search(str(w)) for w in stage.argv):
+                # cp f{,.bak}: the operands the program sees aren't these
+                out.append(("write", UNPLACED + "brace expansion", None, None))
             out += [("write",) + w for w in _writes(stage, strict)]
             if stage.subst:
                 out += [("write",) + w for w in _inner_writes(stage, stage.cwd,

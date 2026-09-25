@@ -332,10 +332,17 @@ changed this turn, after its last change and after the last shell command.
 - A write the gate can't place (a glob, a variable, an unknown directory,
   an unparseable command, a background job still running) ends the turn
   unverified rather than passing it.
+- So does a program whose writes the parser doesn't model: a script, a
+  build, a formatter, `xargs`, `find -exec`, `bash -c`, `git checkout`,
+  `tar -x`. Declare the ones you know write no files, by name or by name
+  and leading words: `strict_trusted_programs=("pytest", "npm test")`.
+  Their redirects (`pytest > log`) are still owed.
 - A tool the gate doesn't know blocks verification until you declare it
   (`read_only_tools`, `neutral_tools`, `mutating_tools`): it could have
   changed anything. A subagent's changes count like the agent's own.
-- The price, measured by the benchmark: it blocks 49% of the benchmark's
+- A background command stays owed, across turns too, until `BashOutput`
+  reports it finished or `KillShell` stops it; what it wrote is owed then.
+- The price, measured by the benchmark: it blocks 51% of the benchmark's
   honest transcripts (the ones that verify through shell or search);
   moving or deleting a changed file ends the turn unverified; so does a
   turn that only ran commands without reading what they changed.

@@ -63,8 +63,8 @@ import re
 from ..boundary import ACCEPT, boundary_check
 from ..classifier import classify_observation
 from .. import shell
-from ..state import (_PATH_KEYS, UNPLACED, GateState, Symbol, extract_identifiers,
-                     path_values, surface_hits)
+from ..state import (_PATH_KEYS, UNPLACED, GateState, Symbol, _trusted,
+                     extract_identifiers, path_values, surface_hits)
 
 # Built-in SDK tools by consequence class. Unknown tools (MCP tools other than
 # the reference filesystem server's, see _MCP_FILESYSTEM) are treated as
@@ -92,7 +92,16 @@ DEFAULT_MUTATING_TOOLS = frozenset(
 # Tools that neither read nor change files (planning, questions, to-dos).
 # Strict reads treats every tool outside the known sets as a possible change.
 DEFAULT_NEUTRAL_TOOLS = frozenset(
-    {"TodoWrite", "TodoRead", "ExitPlanMode", "AskUserQuestion"})
+    {"TodoWrite", "TodoRead", "ExitPlanMode", "AskUserQuestion",
+     "BashOutput", "KillShell", "KillBash"})
+# tools that report on (or stop) a background command started with
+# run_in_background, by the key naming it
+_BACKGROUND_TOOLS = {"BashOutput": "bash_id", "KillShell": "shell_id",
+                     "KillBash": "shell_id"}
+_JOB_DONE = re.compile(r"\bstatus\W{1,4}(?:completed|failed|killed|exited)\b")
+# read arguments that select part of a file
+_PARTIAL_KEYS = ("offset", "limit", "head", "tail", "pages", "cell_id", "cell",
+                 "start_line", "end_line", "line", "lines", "view_range", "range")
 # MCP servers whose read tools strict reads trusts to show the LOCAL file
 # (a server named "docker" or "remote" reads somewhere else)
 DEFAULT_TRUSTED_MCP_SERVERS = frozenset({"filesystem", "fs"})
@@ -144,6 +153,18 @@ _MCP_FILESYSTEM = {
     # a new, empty directory changes no file's content
     "create_directory": "neutral",
 }
+
+
+def _job_entry(job):
+    return UNPLACED + "background command %s still running" % job
+
+
+def _mcp_server(tool):
+    """The server of an ``mcp__<server>__<tool>`` name, or None when the
+    name is ambiguous (``mcp__fs__remote__read_file``: server ``fs`` or
+    ``fs__remote``?)."""
+    parts = tool.split("__")
+    return parts[1] if tool.startswith("mcp__") and len(parts) == 3 else None
 
 
 def _mcp_class(tool):
@@ -337,6 +358,10 @@ class GateHooks:
             answer but never verify a change. A parser mistake can therefore
             only block honest work, never let an unbacked claim through. The
             cost: one more Read after running tests or scripts. Default False.
+        strict_trusted_programs: with ``strict_reads``, programs whose writes
+            the shell parser doesn't model but you know write no files, by
+            name or name and leading words (``("pytest", "npm test")``).
+            Any other such program ends the turn unverified. Default ().
         emit_progress: when True, the escape-valve ``systemMessage`` is suffixed
             with a compact ``progress()`` summary (a best-effort, user-facing
             event per the SDK contract). Default False. The reliable programmatic
@@ -358,7 +383,8 @@ class GateHooks:
                  normalizers=None, extractors=None,
                  verifier=None, emit_progress=False, home=None,
                  strict_reads=False, neutral_tools=DEFAULT_NEUTRAL_TOOLS,
-                 trusted_mcp_servers=DEFAULT_TRUSTED_MCP_SERVERS):
+                 trusted_mcp_servers=DEFAULT_TRUSTED_MCP_SERVERS,
+                 strict_trusted_programs=()):
         extractors = dict(extractors or {})
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
@@ -386,6 +412,10 @@ class GateHooks:
         self.content_tools = set(content_tools)
         self.neutral_tools = set(neutral_tools)
         self.trusted_mcp_servers = set(trusted_mcp_servers)
+        self.strict_trusted_programs = tuple(strict_trusted_programs)
+        # strict reads: background commands still running, by id, with what
+        # they ran and where (their writes land whenever they finish)
+        self._background = {}
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
@@ -394,6 +424,9 @@ class GateHooks:
         # runs the agent on this machine, as this user)
         self._home = home if home is not None else os.path.expanduser("~")
         self._mutated_this_turn = False
+        # a subagent (or unclassified tool) changed files this turn: even a
+        # turn with no calls of the agent's own is gated
+        self._changed_by_others = False
 
     # ------------------------------------------------------------ hooks
 
@@ -403,14 +436,19 @@ class GateHooks:
             return {}
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
-        if input_data.get("agent_id") and not self.gate_subagents:
+        subagent = bool(input_data.get("agent_id"))
+        if subagent and not self.gate_subagents:
             # a subagent's reads never reach the main agent; in strict mode
             # its changes still count, as unknown changes
             if self.strict_reads and not self._pure_read(tool):
                 self._unknown_change(input_data)
             return {}
-        self._note_cwd(input_data)
-        tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
+        prior_cwd = self._cwd
+        cwd = self._event_cwd(input_data)
+        if not subagent:
+            self._note_cwd(input_data)   # a subagent's cwd isn't the agent's
+        raw_input = input_data.get("tool_input", "")
+        tool_input = _absolutize(raw_input, cwd)
         output = _output_text(input_data.get("tool_response", ""))
         # (mutation-epoch novelty — a fresh mutation re-opening the verifying
         # re-read — lives in classify_observation's hash tuple, not in the
@@ -435,7 +473,7 @@ class GateHooks:
         if shell_read:
             # only files whose content reached the agent can verify; files
             # it merely listed or counted cannot
-            shown = shell.read_operands(tool_input["command"], output, self._cwd,
+            shown = shell.read_operands(tool_input["command"], output, cwd,
                                         self._home)[0]
             if not surface_hits(shown, self.state.claim_surface):
                 obs["grounds_completion"] = False
@@ -445,8 +483,10 @@ class GateHooks:
                                      input_data.get("tool_response"), result)):
             # a listing shows the file exists, not what the change wrote
             obs["grounds_completion"] = False
-        if self.strict_reads and not self._verifying_read(tool, tool_input, mcp):
-            # strict: only a whole, direct, local file read verifies a change
+        if self.strict_reads and (subagent or not self._verifying_read(
+                tool, raw_input if mcp else tool_input, mcp)):
+            # strict: only the agent's own whole, direct, local file read
+            # verifies a change
             obs["grounds_completion"] = False
         qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
         self.state.grounded_this_turn |= obs["grounds_assertion"]
@@ -466,12 +506,20 @@ class GateHooks:
             if obs["grounds_completion"]:
                 self.state.last_verification_step = self.state.current_step
         if (tool in self.mutating_tools and not shell_read) or mcp == "mutating":
-            self._record_mutation(tool_input, output)
+            self._record_mutation(tool_input, output, cwd=cwd, tool=tool)
+            if self.strict_reads and prior_cwd and prior_cwd != cwd \
+                    and isinstance(tool_input, dict) \
+                    and isinstance(tool_input.get("command"), str):
+                # the hook may report the directory the command ended in
+                # (after its own `cd`): place its writes from where it
+                # started too
+                self._record_mutation(tool_input, output, cwd=prior_cwd, tool=tool)
             if self.strict_reads and isinstance(tool_input, dict) \
                     and tool_input.get("run_in_background"):
                 # it keeps running (and writing) after this call returns
-                self.state.pending_verification.add(
-                    UNPLACED + "background command still running")
+                self._start_background(input_data, tool_input, cwd)
+        if self.strict_reads and tool in _BACKGROUND_TOOLS:
+            self._check_background(tool, tool_input, result)
         return {}
 
     async def post_tool_use_failure(self, input_data, tool_use_id, context):
@@ -487,13 +535,15 @@ class GateHooks:
             return {}
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
-        self._note_cwd(input_data)
+        cwd = self._event_cwd(input_data)
+        if not input_data.get("agent_id"):
+            self._note_cwd(input_data)
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
-        tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
+        tool_input = _absolutize(input_data.get("tool_input", ""), cwd)
         if ((tool in self.mutating_tools and not self._is_shell_read(tool, tool_input))
                 or _mcp_class(tool) == "mutating"):
-            self._record_mutation(tool_input, failed=True)
+            self._record_mutation(tool_input, failed=True, cwd=cwd, tool=tool)
         elif self.strict_reads and not self._classified(tool, _mcp_class(tool)):
             self._unknown_change(input_data, counted=True)
         return {}
@@ -502,7 +552,7 @@ class GateHooks:
         """Stop: the submit boundary. Block ungrounded finishes."""
         if input_data.get("hook_event_name") != "Stop":
             return {}
-        if self._tool_calls_this_turn == 0:
+        if self._tool_calls_this_turn == 0 and not self._changed_by_others:
             return {}   # tool-free turn: conversational, gate exempt
 
         # a turn that changed nothing makes assertions, whatever earlier
@@ -545,7 +595,11 @@ class GateHooks:
         self.state.pending_verification = set()
         self.state.pending_aliases = {}
         self.state.changed_this_turn = set()
-        self._mutated_this_turn = False
+        for job in self._background:
+            # still running: it may write during this turn too
+            self.state.pending_verification.add(_job_entry(job))
+        self._mutated_this_turn = bool(self._background)
+        self._changed_by_others = False
         self.state.turn_observations = []    # per-turn; load-bearing (else a long
         #                                      session leaks retained observations).
         # last_verification_step is intentionally NOT reset — it is a monotonic
@@ -627,14 +681,18 @@ class GateHooks:
         ``read_only_tools``, ``neutral_tools`` or ``mutating_tools``."""
         if not counted:
             self.state.current_step += 1
+            self._changed_by_others = True
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
-        tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
+        cwd = self._event_cwd(input_data)      # the subagent's, not the agent's
+        tool_input = _absolutize(input_data.get("tool_input", ""), cwd)
         failed = input_data.get("hook_event_name") == "PostToolUseFailure"
         if tool in self.mutating_tools or _mcp_class(tool) == "mutating":
             self._record_mutation(tool_input,
                                   _output_text(input_data.get("tool_response", "")),
-                                  failed=failed)
+                                  failed=failed, cwd=cwd, tool=tool)
+            if isinstance(tool_input, dict) and tool_input.get("run_in_background"):
+                self._start_background(input_data, tool_input, cwd)
             return
         targets = {t if t.startswith("/") else UNPLACED + t
                    for t in path_values(tool_input) if isinstance(tool_input, dict)}
@@ -650,19 +708,53 @@ class GateHooks:
         reads, and read tools on MCP servers not trusted to be local don't
         verify."""
         if mcp == "content":
-            server = tool.split("__")[1] if tool.count("__") >= 2 else ""
-            if server not in self.trusted_mcp_servers or \
-                    tool.endswith("read_multiple_files"):
+            if not self._trusted_server(tool) or tool.endswith("read_multiple_files"):
                 return False
         elif tool not in self.content_tools:
             return False
         if not isinstance(tool_input, dict):
             return False
-        if any(tool_input.get(k) not in (None, "", 0) for k in
-               ("offset", "limit", "head", "tail", "pages")):
+        if any(tool_input.get(k) not in (None, "", 0) for k in _PARTIAL_KEYS):
             return False
+        # one file; an MCP read's path as given (the server resolves a
+        # relative path against its own directory, not the session's)
         paths = path_values(tool_input)
-        return bool(paths) and all(p.startswith("/") for p in paths)
+        return len(paths) == 1 and all(p.startswith("/") for p in paths)
+
+    def _trusted_server(self, tool):
+        return _mcp_server(tool) in self.trusted_mcp_servers
+
+    def _event_cwd(self, input_data):
+        cwd = input_data.get("cwd")
+        return cwd if isinstance(cwd, str) and cwd.startswith("/") else self._cwd
+
+    def _start_background(self, input_data, tool_input, cwd):
+        command = tool_input.get("command")
+        effs = shell.effects(command, cwd, "", self._home, True) \
+            if isinstance(command, str) else None
+        if effs is not None and all(
+                e[0] == "read" or e[0] == "opaque" and _trusted(
+                    e[1], self.strict_trusted_programs) for e in effs):
+            return            # writes nothing: nothing lands later
+        response = input_data.get("tool_response")
+        job = response.get("backgroundTaskId") if isinstance(response, dict) else None
+        job = str(job) if job else "#%d" % (len(self._background) + 1)
+        self._background[job] = (dict(tool_input, run_in_background=False), cwd)
+        self.state.pending_verification.add(_job_entry(job))
+
+    def _check_background(self, tool, tool_input, result):
+        """A background command that finished (or was killed) wrote what it
+        wrote by now: owe that as a change made at this point."""
+        job = tool_input.get(_BACKGROUND_TOOLS[tool]) \
+            if isinstance(tool_input, dict) else None
+        job = str(job) if job is not None else None
+        if job not in self._background:
+            return
+        if tool == "BashOutput" and not _JOB_DONE.search(result):
+            return
+        command, cwd = self._background.pop(job)
+        self.state.pending_verification.discard(_job_entry(job))
+        self._record_mutation(command, cwd=cwd)
 
     def _note_cwd(self, input_data):
         """Track the session's working directory (every SDK hook input
@@ -677,13 +769,23 @@ class GateHooks:
     def _shell_extract(self, args, result):
         return _shell_identifiers(args, result, self._cwd, self._home)
 
-    def _record_mutation(self, tool_input, output="", failed=False):
+    def _record_mutation(self, tool_input, output="", failed=False, cwd=None,
+                         tool=""):
         # a NEW mutation invalidates any earlier verification, its targets are
         # owed a re-read, and mutated identifiers join the claim surface so
         # only reads of THOSE count as verification
         self._mutated_this_turn = True
-        self.state.note_mutation(tool_input, self._cwd, output, failed, self._home,
-                                 strict=self.strict_reads)
+        if self.strict_reads and _mcp_class(tool) == "mutating" \
+                and not self._trusted_server(tool):
+            # another machine's (a container's) files: no local read pays
+            self.state.note_unknown_change(
+                {UNPLACED + "files changed by %s (its server isn't trusted as "
+                 "local: trusted_mcp_servers)" % tool})
+            return
+        self.state.note_mutation(tool_input, self._cwd if cwd is None else cwd,
+                                 output, failed, self._home,
+                                 strict=self.strict_reads,
+                                 trusted_programs=self.strict_trusted_programs)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier
