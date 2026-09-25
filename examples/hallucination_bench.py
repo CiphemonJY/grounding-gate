@@ -1478,6 +1478,10 @@ def sdk_verdict(events, surface, strict=False, trusted=()):
                      strict_trusted_programs=trusted)
     hook = {"tool": gate.post_tool_use, "fail": gate.post_tool_use_failure,
             "prompt": gate.user_prompt_submit, "stop": gate.stop}
+    # a real session's turn opens with UserPromptSubmit, which carries the
+    # working directory the first command starts in
+    _drive(gate.user_prompt_submit(
+        {"hook_event_name": "UserPromptSubmit", "cwd": ROOT}, None, None))
     out = None
     for kind, data in events:
         out = _drive(hook[kind](data, None, None))

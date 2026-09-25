@@ -98,7 +98,7 @@ DEFAULT_NEUTRAL_TOOLS = frozenset(
 # run_in_background, by the key naming it
 _BACKGROUND_TOOLS = {"BashOutput": "bash_id", "KillShell": "shell_id",
                      "KillBash": "shell_id"}
-_JOB_DONE = re.compile(r"\bstatus\W{1,4}(?:completed|failed|killed|exited)\b")
+_JOB_DONE = re.compile(r"\s*<status>(?:completed|failed|killed|exited)</status>")
 # read arguments that select part of a file
 _PARTIAL_KEYS = ("offset", "limit", "head", "tail", "pages", "cell_id", "cell",
                  "start_line", "end_line", "line", "lines", "view_range", "range")
@@ -153,6 +153,26 @@ _MCP_FILESYSTEM = {
     # a new, empty directory changes no file's content
     "create_directory": "neutral",
 }
+
+
+def _truncated(response):
+    """A Read response that shows only part of the file: Claude Code's
+    ``{"file": {"startLine", "numLines", "totalLines"}}`` says so."""
+    info = response.get("file") if isinstance(response, dict) else None
+    if not isinstance(info, dict):
+        return False
+    start, num, total = (info.get(k) for k in ("startLine", "numLines", "totalLines"))
+    if isinstance(start, int) and start > 1:
+        return True
+    return isinstance(num, int) and isinstance(total, int) and num < total
+
+
+def _job_done(response):
+    """A BashOutput response whose own status says the job ended (not text
+    the job printed)."""
+    if isinstance(response, dict):
+        return response.get("status") in ("completed", "failed", "killed", "exited")
+    return isinstance(response, str) and bool(_JOB_DONE.match(response))
 
 
 def _job_entry(job):
@@ -416,6 +436,7 @@ class GateHooks:
         # strict reads: background commands still running, by id, with what
         # they ran and where (their writes land whenever they finish)
         self._background = {}
+        self._agent_cwds = {}          # a subagent's last reported cwd
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
@@ -432,7 +453,31 @@ class GateHooks:
 
     async def post_tool_use(self, input_data, tool_use_id, context):
         """PostToolUse: classify the successful observation, update state."""
-        if input_data.get("hook_event_name") != "PostToolUse":
+        try:
+            return self._post_tool_use(input_data)
+        except Exception:                                  # noqa: BLE001
+            return self._fail_closed()
+
+    async def post_tool_use_failure(self, input_data, tool_use_id, context):
+        """PostToolUseFailure: no grounding credit, but a failed MUTATING
+        call may still have had a partial effect — demand verification."""
+        try:
+            return self._post_tool_use_failure(input_data)
+        except Exception:                                  # noqa: BLE001
+            return self._fail_closed()
+
+    def _fail_closed(self):
+        """A hook that crashed may have missed a change: nothing this turn
+        can verify it (the turn ends unverified rather than trusting it)."""
+        self.state.note_unknown_change(
+            {UNPLACED + "grounding-gate hit an error reading a tool call"})
+        self._mutated_this_turn = True
+        self._changed_by_others = True
+        return {}
+
+    def _post_tool_use(self, input_data):
+        if not isinstance(input_data, dict) or \
+                input_data.get("hook_event_name") != "PostToolUse":
             return {}
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
@@ -484,7 +529,8 @@ class GateHooks:
             # a listing shows the file exists, not what the change wrote
             obs["grounds_completion"] = False
         if self.strict_reads and (subagent or not self._verifying_read(
-                tool, raw_input if mcp else tool_input, mcp)):
+                tool, raw_input if mcp else tool_input, mcp,
+                input_data.get("tool_response"))):
             # strict: only the agent's own whole, direct, local file read
             # verifies a change
             obs["grounds_completion"] = False
@@ -506,26 +552,18 @@ class GateHooks:
             if obs["grounds_completion"]:
                 self.state.last_verification_step = self.state.current_step
         if (tool in self.mutating_tools and not shell_read) or mcp == "mutating":
-            self._record_mutation(tool_input, output, cwd=cwd, tool=tool)
-            if self.strict_reads and prior_cwd and prior_cwd != cwd \
-                    and isinstance(tool_input, dict) \
-                    and isinstance(tool_input.get("command"), str):
-                # the hook may report the directory the command ended in
-                # (after its own `cd`): place its writes from where it
-                # started too
-                self._record_mutation(tool_input, output, cwd=prior_cwd, tool=tool)
-            if self.strict_reads and isinstance(tool_input, dict) \
-                    and tool_input.get("run_in_background"):
-                # it keeps running (and writing) after this call returns
-                self._start_background(input_data, tool_input, cwd)
+            response = input_data.get("tool_response")
+            # a timed-out or interrupted command stopped somewhere unknown
+            interrupted = isinstance(response, dict) and response.get("interrupted") is True
+            self._mutate(tool, raw_input, tool_input, output, interrupted, cwd,
+                         prior_cwd, input_data)
         if self.strict_reads and tool in _BACKGROUND_TOOLS:
-            self._check_background(tool, tool_input, result)
+            self._check_background(tool, tool_input, input_data.get("tool_response"))
         return {}
 
-    async def post_tool_use_failure(self, input_data, tool_use_id, context):
-        """PostToolUseFailure: no grounding credit, but a failed MUTATING
-        call may still have had a partial effect — demand verification."""
-        if input_data.get("hook_event_name") != "PostToolUseFailure":
+    def _post_tool_use_failure(self, input_data):
+        if not isinstance(input_data, dict) or \
+                input_data.get("hook_event_name") != "PostToolUseFailure":
             return {}
         if input_data.get("agent_id") and not self.gate_subagents:
             if self.strict_reads:
@@ -535,15 +573,18 @@ class GateHooks:
             return {}
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
+        prior_cwd = self._cwd
         cwd = self._event_cwd(input_data)
         if not input_data.get("agent_id"):
             self._note_cwd(input_data)
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
-        tool_input = _absolutize(input_data.get("tool_input", ""), cwd)
+        raw_input = input_data.get("tool_input", "")
+        tool_input = _absolutize(raw_input, cwd)
         if ((tool in self.mutating_tools and not self._is_shell_read(tool, tool_input))
                 or _mcp_class(tool) == "mutating"):
-            self._record_mutation(tool_input, failed=True, cwd=cwd, tool=tool)
+            self._mutate(tool, raw_input, tool_input, "", True, cwd, prior_cwd,
+                         input_data)
         elif self.strict_reads and not self._classified(tool, _mcp_class(tool)):
             self._unknown_change(input_data, counted=True)
         return {}
@@ -552,7 +593,8 @@ class GateHooks:
         """Stop: the submit boundary. Block ungrounded finishes."""
         if input_data.get("hook_event_name") != "Stop":
             return {}
-        if self._tool_calls_this_turn == 0 and not self._changed_by_others:
+        if self._tool_calls_this_turn == 0 and not self._changed_by_others \
+                and not self._background:
             return {}   # tool-free turn: conversational, gate exempt
 
         # a turn that changed nothing makes assertions, whatever earlier
@@ -585,6 +627,8 @@ class GateHooks:
 
     async def user_prompt_submit(self, input_data, tool_use_id, context):
         """UserPromptSubmit: a new turn — reset per-turn state and rope."""
+        if isinstance(input_data, dict):
+            self._note_cwd(input_data)     # where the turn's first command starts
         self.state.grounded_this_turn = False
         self.state.verified_this_turn = False
         self.state.halted = False
@@ -685,14 +729,19 @@ class GateHooks:
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
         cwd = self._event_cwd(input_data)      # the subagent's, not the agent's
-        tool_input = _absolutize(input_data.get("tool_input", ""), cwd)
-        failed = input_data.get("hook_event_name") == "PostToolUseFailure"
+        agent = str(input_data.get("agent_id") or "")
+        prior = self._agent_cwds.get(agent, "") if agent else self._cwd
+        if agent and isinstance(input_data.get("cwd"), str) \
+                and input_data["cwd"].startswith("/"):
+            self._agent_cwds[agent] = input_data["cwd"]
+        raw_input = input_data.get("tool_input", "")
+        tool_input = _absolutize(raw_input, cwd)
+        response = input_data.get("tool_response")
+        failed = input_data.get("hook_event_name") == "PostToolUseFailure" or (
+            isinstance(response, dict) and response.get("interrupted") is True)
         if tool in self.mutating_tools or _mcp_class(tool) == "mutating":
-            self._record_mutation(tool_input,
-                                  _output_text(input_data.get("tool_response", "")),
-                                  failed=failed, cwd=cwd, tool=tool)
-            if isinstance(tool_input, dict) and tool_input.get("run_in_background"):
-                self._start_background(input_data, tool_input, cwd)
+            self._mutate(tool, raw_input, tool_input, _output_text(response or ""),
+                         failed, cwd, prior, input_data)
             return
         targets = {t if t.startswith("/") else UNPLACED + t
                    for t in path_values(tool_input) if isinstance(tool_input, dict)}
@@ -702,7 +751,7 @@ class GateHooks:
         self.state.note_unknown_change(targets)
         self._mutated_this_turn = True
 
-    def _verifying_read(self, tool, tool_input, mcp):
+    def _verifying_read(self, tool, tool_input, mcp, response=None):
         """Strict reads: a direct read of one whole local file, by an
         absolute path. Partial reads (offset/limit, head/tail), multi-file
         reads, and read tools on MCP servers not trusted to be local don't
@@ -718,8 +767,58 @@ class GateHooks:
             return False
         # one file; an MCP read's path as given (the server resolves a
         # relative path against its own directory, not the session's)
+        if _truncated(response):
+            return False
         paths = path_values(tool_input)
         return len(paths) == 1 and all(p.startswith("/") for p in paths)
+
+    def _mutate(self, tool, raw_input, tool_input, output, failed, cwd, prior,
+                input_data):
+        """Record a mutating call. In strict mode a shell command is placed
+        from every directory it may have started in (the hook's ``cwd`` may
+        be where it ENDED, after its own ``cd``), and an MCP tool's
+        relative path stays unplaced (its server resolves it, not us)."""
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        if not self.strict_reads:
+            self._record_mutation(tool_input, output, failed, cwd=cwd, tool=tool)
+            return
+        if isinstance(command, str):
+            places = self._command_starts(command, cwd, prior)
+            for place in places:
+                if place is None:
+                    self.state.note_unknown_change(
+                        {UNPLACED + "a command that changed directory, from an "
+                         "unknown start: " + command[:60]})
+                    self._mutated_this_turn = True
+                else:
+                    self._record_mutation(tool_input, output, failed, cwd=place,
+                                          tool=tool)
+            if tool_input.get("run_in_background"):
+                # it keeps running (and writing) after this call returns
+                self._start_background(input_data, tool_input,
+                                       next(iter(p for p in places if p), cwd))
+            return
+        if tool.startswith("mcp__"):
+            self._record_mutation(raw_input, output, failed, cwd="", tool=tool)
+            return
+        self._record_mutation(tool_input, output, failed, cwd=cwd, tool=tool)
+
+    def _command_starts(self, command, reported, prior):
+        """Where a command may have started, given the hook's ``reported``
+        cwd and the one tracked before it (``prior``); None: unknown."""
+        if prior:
+            if reported == prior or reported in shell.final_cwds(
+                    command, prior, self._home):
+                return [prior]
+            return [prior, reported]
+        if not reported:
+            return [reported]
+        # no earlier cwd: only a command that never changes directory is
+        # placed with certainty (`cd /abs` ends there from ANY start)
+        probe = "/nonexistent-start-of-grounding-gate"
+        if shell.final_cwds(command, probe, self._home) == {probe}:
+            return [reported]
+        return [reported, None]
 
     def _trusted_server(self, tool):
         return _mcp_server(tool) in self.trusted_mcp_servers
@@ -742,7 +841,7 @@ class GateHooks:
         self._background[job] = (dict(tool_input, run_in_background=False), cwd)
         self.state.pending_verification.add(_job_entry(job))
 
-    def _check_background(self, tool, tool_input, result):
+    def _check_background(self, tool, tool_input, response):
         """A background command that finished (or was killed) wrote what it
         wrote by now: owe that as a change made at this point."""
         job = tool_input.get(_BACKGROUND_TOOLS[tool]) \
@@ -750,7 +849,7 @@ class GateHooks:
         job = str(job) if job is not None else None
         if job not in self._background:
             return
-        if tool == "BashOutput" and not _JOB_DONE.search(result):
+        if tool == "BashOutput" and not _job_done(response):
             return
         command, cwd = self._background.pop(job)
         self.state.pending_verification.discard(_job_entry(job))

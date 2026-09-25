@@ -22,6 +22,7 @@ resolved against ``cwd``, ``home``, and any ``cd``/``pushd`` in the command.
 import fnmatch  # noqa: F401  (re-exported for state's glob matching)
 import posixpath
 import re
+import sys
 
 # ------------------------------------------------------------------ lexer
 
@@ -265,6 +266,7 @@ class Stages(list):
     output (``{ ...; }``, ``( ... )``, ``if ... fi``) is piped or redirected
     as a whole: what its stages printed never reached the agent directly."""
     grouped_output = False
+    final_cwds = frozenset()
 
 
 class Stage:
@@ -307,7 +309,8 @@ _PREFIXES = frozenset({"sudo", "time", "command", "nohup", "env", "builtin",
                        "!", "{"})
 _CLOSERS = frozenset({"}", "fi", "done", "esac"})
 _OPENERS = frozenset({"{", "if", "while", "until"})
-_CONDITIONAL = re.compile(r"(?:^|[;&|\n(]\s*)(?:if|while|until|case|for|select)\s")
+_CONDITIONAL = re.compile(
+    r"(?:^|[;&|\n({!]\s*|\btime\s+)(?:if|while|until|case|for|select)\s")
 
 
 def resolve(path, cwd, home=None):
@@ -361,27 +364,31 @@ def parse(command, cwd="", home=None):
     argv, redirects, subst = [], [], False
     expect_target, piped_in, just_closed = None, False, False
     in_pattern = False          # reading a case pattern (`x)`), not a command
+    last_sep, pending_alt = ";", None
 
     def flush(sep):
-        nonlocal argv, redirects, subst, base, piped_in, base_alt
+        nonlocal argv, redirects, subst, base, piped_in, base_alt, last_sep, \
+            pending_alt
         piped = sep in ("|", "|&")
         if argv and argv[0] in _CLOSERS and (piped or redirects):
             stages.grouped_output = True
-        words = argv
+        words, closed = argv, 0
+        while words and words[0] in _CLOSERS:
+            words, closed = words[1:], closed + 1    # (a file named `done` stays)
+        if words[:1] == ["[["]:
+            redirects = []                # `[[ a > b ]]` compares strings
         opened = []
         while words and (_ASSIGNMENT.match(words[0]) or words[0] in _PREFIXES):
-            if words[0] in ("sudo", "env", "command") and len(words) > 1 \
+            if words[0] in ("sudo", "env", "command", "time") and len(words) > 1 \
                     and words[1].startswith("-"):
                 break            # `sudo -u www ...`: options we can't read
             if words[0] in _OPENERS:
                 opened.append(words[0])
             words = words[1:]
-        if words and words[0] in ("for", "select", "case"):
+        if words and words[0] in ("for", "select"):
             opened.append(words[0])
         for kind in opened:
             groups.append((base, base_alt, kind))
-        closed = sum(1 for w in words if w in _CLOSERS)
-        words = [w for w in words if w not in _CLOSERS]
         if words[:1] == ["case"]:
             words = []                  # `case WORD in` runs nothing
         if words or redirects or subst:
@@ -390,6 +397,8 @@ def parse(command, cwd="", home=None):
             stage.raw = list(argv)          # with assignments, for substitutions
             stage.certain = not conditional and sep != "&"
             stages.append(stage)
+            guarded = last_sep in ("&&", "||")
+            last_sep = sep
             name = words[0] if words else ""
             if name in ("cd", "pushd", "popd") and not piped and sep != "&" \
                     and not piped_in:
@@ -401,9 +410,19 @@ def parse(command, cwd="", home=None):
                         dirstack.append(base)
                     new = None if target == "-" else resolve(target, base, home)
                 # after `cd x;` the next command runs even if cd failed, so
-                # only `cd x && ...` pins where it runs
-                base_alt = None if sep == "&&" else base
+                # only `cd x && ...` pins where it runs; after `[ x ] && cd y
+                # && z` only z's list is pinned: a later list may run where
+                # the cd never happened
+                if sep == "&&":
+                    base_alt = None
+                    if guarded:
+                        pending_alt = base
+                else:
+                    base_alt = base
                 base = new
+            if sep not in ("&&", "|", "|&") and pending_alt is not None:
+                base_alt = base_alt if base_alt is not None else pending_alt
+                pending_alt = None
         for _ in range(closed):
             if groups:
                 outer_base, outer_alt, kind = groups.pop()
@@ -435,6 +454,7 @@ def parse(command, cwd="", home=None):
             subst = subst or value.subst
             if value == "in" and argv[:1] == ["case"] and len(argv) == 3:
                 in_pattern = True
+                groups.append((base, base_alt, "case"))
         elif in_pattern and value == "(" and not argv:
             continue                     # `(x)` pattern form
         elif in_pattern and value == ")":
@@ -461,6 +481,8 @@ def parse(command, cwd="", home=None):
     last_list = len(stages) - 1
     while last_list > 0 and stages[last_list - 1].sep in ("&&", "|", "|&"):
         last_list -= 1
+    # where the command ends up: the hook may report this directory
+    stages.final_cwds = {base, base_alt} - {None} if base is not None else {None}
     guarded = False
     for k, stage in enumerate(stages):
         if k and stages[k - 1].sep not in ("&&", "|", "|&"):
@@ -532,7 +554,7 @@ _DIFF_SUMMARY = frozenset({"--stat", "--numstat", "--shortstat", "--name-only",
 _SED_ADDR = r"(?:\d+|\$|/[^/]*/)"
 _SED_PRINT_ONLY = re.compile(r"^(?:%s(?:,%s)?)?!?p$" % (_SED_ADDR, _SED_ADDR))
 _AWK_UNSAFE = re.compile(
-    r"system|getline|close|fflush|BEGIN|END|\||"
+    r"system|getline|close|fflush|BEGIN|END|@|\||"
     r"\bprintf?\b[^;}]*?(?<![<>=!])>(?!=)")
 _PYTHON = re.compile(r"^python(?:3(?:\.\d+)?)?$")
 _REVISION = re.compile(r"^(?:HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD|@)(?:[~^].*)?$|"
@@ -551,8 +573,21 @@ _WRAPPERS = {
     "nice": ({"-n", "--adjustment"}, 0),
     "stdbuf": ({"-i", "-o", "-e", "--input", "--output", "--error"}, 0),
     "ionice": ({"-c", "-n", "-p", "--class", "--classdata"}, 0),
-    "nohup": (set(), 0), "time": (set(), 0), "command": (set(), 0),
+    "nohup": (set(), 0), "command": (set(), 0),
+    "time": ({"-f", "--format"}, 0),
 }
+
+
+_SYSTEM_BIN = ("/bin/", "/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/",
+               "/usr/sbin/", "/sbin/")
+
+
+def _system_name(word):
+    """``/usr/bin/sed`` is ``sed``; any other path keeps its spelling."""
+    if "/" in word and any(word.startswith(d) and "/" not in word[len(d):]
+                           for d in _SYSTEM_BIN):
+        return word.rsplit("/", 1)[1]
+    return word
 
 
 def _unwrap(name, args):
@@ -567,13 +602,16 @@ def _unwrap(name, args):
             break
         if name == "command" and a != "-p":
             return None                    # -v/-V describe, they don't run
+        if name == "time" and (a.startswith("-o") or a.startswith("--o")
+                               or a.startswith("-a")):
+            return None                    # time -o FILE writes its report
         if name == "nice" and re.match(r"^-\d+$", a):
             k += 1
             continue
         if a in takes_value:
             k += 2
             continue
-        if "=" in a or name in ("timeout", "time", "nohup", "command") or (
+        if "=" in a or name in ("timeout", "time", "nohup") or (
                 name == "stdbuf" and len(a) > 2) or (
                 name in ("nice", "ionice") and len(a) > 2 and a[2:].isdigit()):
             k += 1
@@ -586,22 +624,26 @@ def _unwrap(name, args):
 def _program(stage):
     """``(name, args, cwd)``; git subcommands are named ``git diff`` etc.,
     with global options skipped (``-C DIR`` moves the base)."""
-    argv, cwd = stage.argv, stage.cwd
-    if argv and posixpath.basename(argv[0]) == "busybox":
-        argv = argv[1:]
-    if not argv:
-        return "", [], cwd
-    # /usr/bin/sed is sed; gsed and gawk are GNU sed and awk
-    base = posixpath.basename(argv[0]) if "/" in argv[0] else argv[0]
-    base = _ALIASES.get(base, base)
-    if base != argv[0]:
-        argv = [base] + list(argv[1:])
-    if base in _WRAPPERS:
-        inner = _unwrap(base, list(argv[1:]))
-        if inner:
-            return _program(Stage(inner, stage.redirects, stage.subst, stage.piped,
-                                  stage.piped_in, cwd, stage.home, stage.sep,
-                                  stage.cwd_alt))
+    argv, cwd = list(stage.argv), stage.cwd
+    for _ in range(8):
+        if argv and _system_name(argv[0]) == "busybox":
+            argv = argv[1:]
+        if not argv:
+            return "", [], cwd
+        # /usr/bin/sed is sed; gsed and gawk are GNU sed and awk. A repo's
+        # own script/test or ./cat is NOT the system program.
+        base = _system_name(argv[0])
+        base = _ALIASES.get(base, base)
+        if base != argv[0]:
+            argv = [base] + argv[1:]
+        if base not in _WRAPPERS:
+            break
+        inner = _unwrap(base, argv[1:])
+        if not inner:
+            break
+        argv = inner
+    else:
+        return "wrapper", argv, cwd        # too deep: stays opaque
     if argv[0] == "git":
         k = 1
         while k < len(argv) and argv[k].startswith("-"):
@@ -652,11 +694,13 @@ def _short_flags(opts):
     return out
 
 
-def _sed_parts(args):
+def _sed_parts(args, bsd=True):
     """``(in_place, scripts, files)`` for a sed argument list. Any short
     bundle with ``i`` (``-ni``, ``-Ei``) edits in place; BSD ``-i ''`` and
     ``-i .bak`` take a separate backup suffix, recognised only when a
-    script and a file still follow it (``-e s/x/y/ -i .env`` edits .env)."""
+    script and a file still follow it (``-e s/x/y/ -i .env`` edits .env).
+    With ``bsd`` False (strict mode on a GNU system) only ``-i ''`` is."""
+    args = [_expand_long(a, _SED_LONG) for a in args]
     in_place, scripts, files, has_e, k = False, [], [], False, 0
     has_e = any(a in ("-e", "--expression", "-f", "--file")
                 or a.startswith("--expression=") or a.startswith("--file=")
@@ -685,7 +729,7 @@ def _sed_parts(args):
             if a == "-i" and k + 1 < len(args):
                 nxt = args[k + 1]
                 following = [x for x in args[k + 2:] if not x.startswith("-")]
-                if nxt == "" or (re.match(r"^\.[\w.-]{1,16}$", nxt)
+                if nxt == "" or (bsd and re.match(r"^\.[\w.-]{1,16}$", nxt)
                                  and len(following) >= (1 if has_e else 2)):
                     k += 1                # BSD/macOS backup suffix
             k += 1
@@ -700,13 +744,53 @@ def _sed_parts(args):
     return in_place, scripts, files
 
 
-# sed's w/W commands and s///w flag write a file; e runs a command
-_SED_WRITES = re.compile(r"(?:^|[^A-Za-z0-9_\\])[gpIiMm0-9]*[wWe](?:\s|$)")
+# the platform's sed: BSD reads `-i .bak` as a backup suffix, GNU as a file
+_BSD_SED = sys.platform == "darwin" or "bsd" in sys.platform
+_SED_LONG = ("--in-place", "--expression", "--file", "--quiet", "--silent",
+             "--regexp-extended", "--null-data", "--zero-terminated",
+             "--separate", "--sandbox", "--unbuffered", "--line-length",
+             "--posix", "--debug", "--follow-symlinks", "--help", "--version")
+
+
+def _expand_long(arg, names):
+    """GNU accepts any unambiguous prefix of a long option (``--in``)."""
+    if not arg.startswith("--") or arg == "--":
+        return arg
+    name, eq, value = arg.partition("=")
+    hits = [n for n in names if n.startswith(name)]
+    return hits[0] + eq + value if len(hits) == 1 else arg
+
+
+_SED_S = re.compile(r"s(.)((?:\\.|(?!\1).)*)\1((?:\\.|(?!\1).)*)\1([A-Za-z0-9]*)")
+_SED_Y = re.compile(r"y(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1")
+_SED_ADDRESS = re.compile(r"/(?:\\.|[^/])*/|\\(.)(?:\\.|(?!\1).)*\1")
+_SED_TEXT = re.compile(r"(^|[;{}\n])[\s0-9$,!~+]*[aic]\b[^\n]*")
+_SED_COMMAND = re.compile(r"(?:^|[;{}\n])[\s0-9$,!~+]*[wWe]")
+
+
+def _sed_writes(script):
+    """Whether a sed script writes a file (``w``/``W`` commands, an s///w
+    flag) or runs one (``e``, s///e)."""
+    if script is None:
+        return True
+    writes = []
+
+    def s_command(m):
+        writes.append(bool(set(m.group(4)) & set("wWe")))
+        return ";"
+    text = _SED_S.sub(s_command, script)
+    if any(writes):
+        return True
+    text = _SED_Y.sub(";", text)
+    text = _SED_ADDRESS.sub("", text)
+    text = _SED_TEXT.sub(r"\1", text)
+    return bool(_SED_COMMAND.search(text))
 
 
 def _sed_backup(args):
     """The backup suffix of an in-place sed (``-i.bak``, ``-ie`` whose
     suffix is ``e``, ``--in-place=.orig``, BSD ``-i .bak``), else None."""
+    args = [_expand_long(a, _SED_LONG) for a in args]
     for k, a in enumerate(args):
         if a.startswith("--in-place="):
             return a.split("=", 1)[1] or None
@@ -719,7 +803,7 @@ def _sed_backup(args):
                 following = [x for x in args[k + 2:] if not x.startswith("-")]
                 has_e = any(x in ("-e", "--expression", "-f", "--file")
                             or x.startswith("--expression=") for x in args)
-                if re.match(r"^\.[\w.-]{1,16}$", nxt) and \
+                if _BSD_SED and re.match(r"^\.[\w.-]{1,16}$", nxt) and \
                         len(following) >= (1 if has_e else 2):
                     return nxt
     return None
@@ -814,9 +898,13 @@ def _shows_content(name, args):
 # (possibly fewer of them); cut, tr, wc, jq and the like transform them
 _PRESERVES = frozenset({"cat", "head", "tail", "grep", "egrep", "fgrep", "rg",
                         "sort", "nl", "less", "more", "sed", "json.tool"})
+_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty",
+                      "/dev/zero", "/dev/stdin", "/dev/full"})
+
+
 def _harmless_target(op, target):
     """Redirect targets that write no file: /dev/*, fd dups, closing."""
-    return (target.startswith("/dev/") or target == "-"
+    return (target in _DEVICES or target.startswith("/dev/fd/") or target == "-"
             or (op in (">&", "<&") and target.isdigit())
             or target.startswith(">(") or target.startswith("<("))
 
@@ -833,13 +921,20 @@ def _stage_read_only(stage):
     name, args, _ = _program(stage)
     if not name:
         return True
-    if _writes_via_option(name, args):
+    if _writes_via_option(name, args) or _runs_programs(stage, name, args):
         return False
     if name.startswith("git "):
         return name[4:] in _READ_ONLY_GIT
     if name in ("sed", "awk", "json.tool"):
         return _is_viewer(name, args)
     return name in _READ_ONLY
+
+
+def final_cwds(command, cwd, home=None):
+    """The directories ``command`` may end in when run from ``cwd`` (None in
+    the set: somewhere unknown)."""
+    stages = parse(command, cwd, home)
+    return {None} if stages is None else set(stages.final_cwds)
 
 
 def is_read_only(command, home=None):
@@ -1086,19 +1181,51 @@ def read_operands(command, output="", cwd="", home=None):
 
 # ---------------------------------------------------------------- effects
 
+_COPY_VALUE_OPTS = {
+    "install": ("-m", "--mode", "-o", "--owner", "-g", "--group", "-S", "--suffix"),
+    "cp": ("-S", "--suffix"),
+    "rsync": ("-e", "--rsh", "--exclude", "--include", "--filter", "-f",
+              "--exclude-from", "--include-from", "--files-from", "--chmod",
+              "--chown", "--rsync-path", "--log-file", "--backup-dir",
+              "--suffix", "--temp-dir", "-T", "--partial-dir", "--compare-dest",
+              "--copy-dest", "--link-dest", "--port", "--password-file"),
+}
+
+
+def _makes_backups(name, args):
+    """cp/mv/install/rsync ``-b``, ``--backup[=...]``, ``-S``/``--suffix``:
+    the file they replace is kept under another name."""
+    for a in args:
+        if a.startswith("--backup") or a.startswith("--suffix"):
+            return True
+        if a.startswith("-") and not a.startswith("--") and (
+                "b" in a[1:] and name != "rsync" or a == "-b" or
+                name != "rsync" and a.startswith("-S")):
+            return True
+        if name == "rsync" and re.match(r"^-[A-Za-z]*b", a):
+            return True
+    return False
+
+
 def _copy_targets(name, args, cwd, home):
     """``(dst, alt)`` per file a ``cp`` writes (alt: the other reading of an
     ambiguous ``cp a b``, b possibly a directory). Glob or variable sources
     into a directory can't be named: nothing is owed for them."""
     target_dir, ops, k = None, [], 0
+    takes_value = _COPY_VALUE_OPTS.get(name, ())
     while k < len(args):
         a = args[k]
         if a in ("-t", "--target-directory") and k + 1 < len(args):
             target_dir = args[k + 1]
             k += 2
             continue
+        if a in takes_value:
+            k += 2                                 # install -m 644
+            continue
         if a.startswith("--target-directory="):
             target_dir = a.split("=", 1)[1]
+        elif a == "--parents" or name == "rsync" and a in ("-R", "--relative"):
+            return [(UNPLACED + name + " " + a, None)]   # keeps source dirs
         elif not a.startswith("-"):
             ops.append(a)
         k += 1
@@ -1108,9 +1235,11 @@ def _copy_targets(name, args, cwd, home):
         *sources, target = ops
     else:
         sources, target = ops, target_dir
+    if set(target) & set("*?[$`"):
+        return [(UNPLACED + name + " into " + target, None)]   # which file?
     out = []
     for s in sources:
-        if set(s) & set("*?$`"):
+        if set(s) & set("*?[$`"):
             out.append((UNPLACED + name + " " + s, None))   # which files landed?
             continue
         inside = posixpath.join(target, posixpath.basename(s.rstrip("/")))
@@ -1150,7 +1279,8 @@ def _writes(stage, strict=False):
     if name == "tee":
         out += _split_args("tee", args)[1]
     elif name == "sed":
-        in_place, scripts, files = _sed_parts(args)
+        # strict mode reads `-i .x` the way this machine's sed does
+        in_place, scripts, files = _sed_parts(args, _BSD_SED if strict else True)
         if in_place:
             out += files
             suffix = _sed_backup(args) if strict else None
@@ -1159,7 +1289,7 @@ def _writes(stage, strict=False):
             elif suffix:
                 out += [f + suffix for f in files]
         if not _is_viewer(name, args) and any(
-                s is None or _SED_WRITES.search(s) for s in scripts):
+                _sed_writes(s) for s in scripts):
             unplaced.append("sed script that writes or runs commands")
     elif name == "sort":
         out += _sort_outputs(args)
@@ -1175,22 +1305,30 @@ def _writes(stage, strict=False):
     elif name == "sponge":
         out += _split_args("sponge", args)[1]
     elif name == "curl":
-        out += _option_values(args, ("-o", "--output"))
-        if any(a in ("-O", "--remote-name", "--remote-name-all") or
-               (a.startswith("-") and not a.startswith("--") and "O" in a[1:])
-               for a in args):
-            unplaced.append("curl -O")
-        if strict:
-            out += _option_values(args, _CURL_FILE_OPTS)
-            if any(a.split("=", 1)[0] in ("-K", "--config", "--output-dir")
-                   or re.match(r"^-[A-Za-z]{2,}$", a) and set(a[1:]) & set("oDcK")
-                   for a in args):
-                unplaced.append("curl options")
+        opts, _ = _bundled_options(args, _CURL_VALUE_LETTERS, _CURL_FILE_OPTS +
+                                   ("--output", "--config", "--output-dir"))
+        for opt, value in opts:
+            if opt in ("-o", "--output") and value is not None:
+                out.append(value)
+            elif opt in ("-O", "--remote-name", "--remote-name-all"):
+                unplaced.append("curl -O")
+            elif strict and opt in ("-K", "--config", "--output-dir"):
+                unplaced.append("curl " + opt)
+            elif strict and opt in _CURL_FILE_OPTS and value is not None:
+                out.append(value)
     elif name == "wget":
-        named = _option_values(args, ("-O", "--output-document"))
+        opts, ops = _bundled_options(args, _WGET_VALUE_LETTERS, _WGET_LONG_VALUES)
+        named = [v for o, v in opts if o in ("-O", "--output-document") and v]
         out += named
-        if not named and any(not a.startswith("-") for a in args):
+        if not named and ops:
             unplaced.append("wget download")
+        if strict:
+            out += [v for o, v in opts if v and o in (
+                "-o", "-a", "--output-file", "--append-output", "--save-cookies",
+                "--rejected-log")]
+            if any(o in ("-e", "--execute", "--warc-file", "-i", "--input-file")
+                   for o, _ in opts):
+                unplaced.append("wget options")
     elif name == "patch":
         unplaced.append("patch")           # the diff names the files
     elif name in ("git checkout", "git restore"):
@@ -1222,6 +1360,8 @@ def _writes(stage, strict=False):
             placed.append((UNPLACED + p, None, None))
     if name in ("cp", "install", "rsync"):
         placed += [(d, a, "dir") for d, a in _copy_targets(name, args, cwd, stage.home)]
+    if strict and name in ("cp", "install", "rsync", "mv") and _makes_backups(name, args):
+        unplaced.append(name + " backup")
     placed += [(UNPLACED + u, None, None) for u in unplaced]
     return placed
 
@@ -1230,6 +1370,48 @@ def _writes(stage, strict=False):
 _CURL_FILE_OPTS = ("-D", "--dump-header", "-c", "--cookie-jar", "--trace",
                    "--trace-ascii", "--libcurl", "--stderr", "--etag-save",
                    "--hsts", "--alt-svc")
+
+
+_CURL_VALUE_LETTERS = frozenset("AbcCdDeEFhHKmoPQrtTuUwxXyYz")
+_WGET_VALUE_LETTERS = frozenset("oaeiBOtTwQPlARDXIU")
+_WGET_LONG_VALUES = ("--output-document", "--output-file", "--append-output",
+                     "--save-cookies", "--rejected-log", "--execute",
+                     "--warc-file", "--input-file")
+
+
+def _bundled_options(args, value_letters, long_values):
+    """``([(option, value)], operands)`` read the getopt way: in a short
+    bundle (``-sSLo f``, ``-qO-``) the first letter that takes a value
+    takes the rest of the bundle, or the next word."""
+    opts, ops, k = [], [], 0
+    while k < len(args):
+        a = args[k]
+        if a == "--":
+            ops += args[k + 1:]
+            break
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            if eq:
+                opts.append((name, value))
+            elif name in long_values and k + 1 < len(args):
+                opts.append((name, args[k + 1]))
+                k += 1
+            else:
+                opts.append((name, None))
+        elif a.startswith("-") and len(a) > 1:
+            for j, letter in enumerate(a[1:], 1):
+                if letter in value_letters:
+                    rest = a[j + 1:]
+                    if not rest and k + 1 < len(args):
+                        rest = args[k + 1]
+                        k += 1
+                    opts.append(("-" + letter, rest))
+                    break
+                opts.append(("-" + letter, None))
+        else:
+            ops.append(a)
+        k += 1
+    return opts, ops
 
 
 def _option_values(args, names):
@@ -1295,6 +1477,8 @@ def _perl_files(args):
 
 def _sort_outputs(args):
     """``sort -o F``, ``-uo F``, ``-oF``, ``--output=F``, ``--output F``."""
+    args = [_expand_long(a, ("--output",)) if a.startswith("--o") else a
+            for a in args]
     out, k = [], 0
     while k < len(args):
         a = args[k]
@@ -1343,14 +1527,14 @@ def _moves(stage):
         sources, target = ops, target_dir
     # a no-clobber or interactive mv may not move anything
     certain = getattr(stage, "certain", True) and not any(
-        a in ("-n", "-i", "--no-clobber", "--interactive") or (
-            a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("ni"))
+        a in ("-n", "-i", "--no-clobber", "--interactive") or a.startswith("--update")
+        or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("niu"))
         for a in args)
     moves = []
     for s in sources:
         if set(s) & set("$`"):
             continue
-        if set(s) & set("*?"):
+        if set(s) & set("*?["):
             src, dst = resolve(s, cwd, stage.home), resolve(target, cwd, stage.home)
             if src and dst:
                 moves.append((src, dst, "*glob*", certain))
@@ -1435,7 +1619,7 @@ def _known_program(stage):
         return args[:1] in (["-v"], ["-V"])    # describes, runs nothing
     if name in _NO_WRITES or name in _KNOWN_EFFECTS or name in ("curl", "wget"):
         return True             # (their file options are parsed by _writes)
-    if _writes_via_option(name, args):
+    if _writes_via_option(name, args) or _runs_programs(stage, name, args):
         return False
     if name.startswith("git "):
         return name[4:] in _READ_ONLY_GIT
@@ -1444,6 +1628,27 @@ def _known_program(stage):
     if name == "find":
         return not any(a in _FIND_ACTIONS for a in args)
     return name in _READ_ONLY
+
+
+def _runs_programs(stage, name, args):
+    """Read-only programs told to run something else: ``git -c`` (hooks,
+    fsmonitor, pagers), ``git grep -O``, ``rg --pre``, ``file -C``."""
+    argv = list(stage.argv)
+    if argv and _system_name(argv[0]) == "git":
+        for a in argv[1:]:
+            if not a.startswith("-"):
+                break
+            if a.startswith("-c") or a.startswith("--config-env") \
+                    or a.startswith("--exec-path"):
+                return True
+    if name == "git grep":
+        return any(a.startswith("-O") or a.startswith("--open-files-in-pager")
+                   for a in args)
+    if name == "rg":
+        return any(a.startswith("--pre") for a in args)
+    if name == "file":
+        return any(a == "-C" or a == "--compile" for a in args)
+    return False
 
 
 _FIND_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete",
@@ -1476,8 +1681,8 @@ def _inner_writes(stage, cwd, home, strict=False, depth=0):
 _NO_WRITES = frozenset({
     "true", "false", ":", "export", "unset", "set", "shift", "local", "declare",
     "typeset", "readonly", "exit", "return", "break", "continue", "sleep",
-    "wait", "read", "for", "select", "case", "in", "shopt", "trap", "alias",
-    "unalias", "hash", "type", "umask", "ulimit", "jobs", "kill", "exec",
+    "wait", "read", "for", "select", "case", "in", "shopt", "alias",
+    "unalias", "hash", "type", "umask", "ulimit", "jobs", "kill", "exec", "[[",
     "git add", "git fetch"})
 _BRACES = re.compile(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}")
 
@@ -1519,6 +1724,10 @@ def effects(command, cwd="", output="", home=None, strict=False):
             if strict and stage.sep == "&" and not _stage_read_only(stage):
                 # a background job keeps writing after this call returns
                 out.append(("write", UNPLACED + "background job", None, None))
+            if name == "wait" and not args and stage.sep != "&" and stage.certain:
+                # every job started so far has finished
+                out = [e for e in out
+                       if e[:2] != ("write", UNPLACED + "background job")]
             out += [("move",) + m for m in _moves(stage)]
             out += [("remove",) + r for r in _removes(stage)]
             if _stage_read_only(stage):

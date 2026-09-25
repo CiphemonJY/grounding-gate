@@ -362,12 +362,110 @@ STRICT_LEAKS_2 = {
 }
 
 
+def _job(cmd, job_id):
+    start = _bash(cmd, run_in_background=True)
+    start["tool_response"]["backgroundTaskId"] = job_id
+    return start
+
+
+def _truncated_read(p):
+    return _ev("Read", {"file_path": p},
+               {"type": "text", "file": {"filePath": p, "content": "x",
+                                         "numLines": 2000, "startLine": 1,
+                                         "totalLines": 5000}})
+
+
+# third strict review
+STRICT_LEAKS_3 = {
+    # a repo's own script is not the system program of the same name
+    "script/test": (_E("/p/x.py"), _bash("script/test"), _R("/p/x.py")),
+    "./cat": (_E("/p/x.py"), _bash("bin/cat x"), _R("/p/x.py")),
+    "glob mv": (_E("/p/x.py"), _bash("mv *.cfg conf/"), _R("/p/x.py")),
+    "glob mv -t": (_E("/p/x.py"), _bash("mv -t conf *.cfg"), _R("/p/x.py")),
+    "truncated Read": (_E("/p/a.cfg"), _truncated_read("/p/a.cfg")),
+    "failed command ending in cd": (
+        _E("/p/x.py"), _R("/p/x.py"),
+        _fail("Bash", {"command": "sed -i s/1/2/ a.cfg && cd pkg && grep -q x a.cfg"},
+              "/p/pkg"), _R("/p/pkg/a.cfg"), _R("/p/x.py")),
+    "first command ends in cd": (_bash("sed -i s/1/2/ a.cfg && cd /p/pkg", "/p/pkg"),
+                                 _R("/p/pkg/a.cfg")),
+    "cp -b": (_E("/p/x.py"), _bash("cp -b a.cfg b.cfg"), _R("/p/b.cfg"), _R("/p/x.py")),
+    "mv --backup": (_E("/p/x.py"), _bash("mv --backup=numbered t b.cfg"),
+                    _R("/p/b.cfg"), _R("/p/x.py")),
+    "wget -o log": (_bash("wget -O a.json -o wget.log https://x"), _R("/p/a.json")),
+    "curl bundle": (_E("/p/x.py"), _bash("curl -sSoout.json https://x"), _R("/p/x.py")),
+    "job status in stdout": (
+        _job("sleep 9; sed -i s/1/2/ b.cfg", "bg2"),
+        _ev("BashOutput", {"bash_id": "bg2"},
+            {"status": "running", "stdout": "job status: completed"}),
+        _R("/p/b.cfg")),
+    "tool-free turn with a job running": (
+        _job("sleep 9; sed -i s/1/2/ b.cfg", "bg1"), "PROMPT"),
+    "relative MCP write": (_ev("mcp__fs__write_file", {"path": "a.cfg"}), _R("/p/a.cfg")),
+    "relative MCP move": (_ev("mcp__fs__move_file", {"source": "/p/x", "destination": "a.cfg"}),
+                          _R("/p/a.cfg")),
+    "case arm cd": (_bash("case $1 in build) cd sub && true;; esac; echo x > a.cfg"),
+                    _R("/p/sub/a.cfg")),
+    "guarded cd": (_bash('[ -n "$CI" ] && cd sub && true; echo x > a.cfg'),
+                   _R("/p/sub/a.cfg")),
+    "sed --in": (_E("/p/x.py"), _bash("sed --in s/1/2/ a.cfg"), _R("/p/x.py")),
+    "sort --out": (_E("/p/x.py"), _bash("sort --out=a.cfg b.cfg"), _R("/p/x.py")),
+    "sed wFILE": (_E("/p/x.py"), _bash("sed -n '/x/wout.txt' a.cfg"), _R("/p/x.py")),
+    "trap": (_E("/p/x.py"), _bash("trap 'sed -i s/1/2/ a.cfg' EXIT; true"), _R("/p/x.py")),
+    "time --output": (_E("/p/x.py"), _bash("timeout 60 time --output=a.cfg ls"),
+                      _R("/p/x.py")),
+    "awk @include": (_E("/p/x.py"), _bash("awk '@include \"inplace\"; 1' a.cfg"),
+                     _R("/p/x.py")),
+    "if in braces": (_bash("echo x > t; { if [ -f flag ]; then mv t a.cfg; fi; }"),
+                     _R("/p/a.cfg")),
+    "interrupted": (_E("/p/x.py"),
+                    _ev("Bash", {"command": "echo x > t.cfg; sleep 999; rm t.cfg"},
+                        {"stdout": "", "stderr": "", "interrupted": True}),
+                    _R("/p/x.py")),
+    "mv --update": (_bash("echo x > t && mv --update=none t a.cfg"), _R("/p/a.cfg")),
+    "/dev/shm": (_E("/p/x.py"), _bash("echo x > /dev/shm/s.json"), _R("/p/x.py")),
+    "file named done": (_E("/p/x.py"), _bash("sed -i s/1/2/ done"), _R("/p/x.py")),
+    "cp --parents": (_E("/p/x.py"), _bash("cp --parents a/b.cfg out"), _R("/p/x.py")),
+    "cp [o]ut": (_E("/p/x.py"), _bash("cp new.cfg [o]ut.cfg"), _R("/p/[o]ut.cfg"),
+                 _R("/p/x.py")),
+    "git -c": (_E("/p/x.py"), _bash("git -c core.fsmonitor=./x status"), _R("/p/x.py")),
+    "rg --pre": (_E("/p/x.py"), _bash("rg --pre ./x foo"), _R("/p/x.py")),
+    "nested wrappers": (_E("/p/x.py"), _R("/p/x.py"),
+                        _bash("nice " * 1000 + "sed -i s/1/2/ a.cfg")),
+}
+
+STRICT_TRAPS_3 = {
+    "cd && write, hook reports the new cwd": (
+        _ev("Read", {"file_path": "/p/x"}, "x"),
+        _bash("cd sub && sed -i s/1/2/ a.cfg", "/p/sub"), _R("/p/sub/a.cfg")),
+    "curl -sSLo": (_bash("curl -sSLo a.json https://x"), _R("/p/a.json")),
+    "wget -qO-": (_bash("wget -qO- https://x | jq . > a.json"), _R("/p/a.json")),
+    "install -m": (_bash("install -m 644 b.cfg a.cfg"), _R("/p/a.cfg")),
+    "jobs then wait": (_bash("sed -i s/1/2/ a & sed -i s/1/2/ b & wait"),
+                       _R("/p/a"), _R("/p/b")),
+    "[[ ]]": (_bash("[[ a > b ]] && echo x > a.cfg"), _R("/p/a.cfg")),
+    "command -v": (_bash("command -v git && echo x > a.cfg"), _R("/p/a.cfg")),
+}
+
+
 def test_strict_review_leaks_are_rejected():
     for name, events in STRICT_LEAKS.items():
         assert strict_events(*events) == "REJECT", name
     for name, events in STRICT_LEAKS_2.items():
         options = {"gate_subagents": True} if name == "gated subagent read" else {}
         assert strict_events(*events, **options) == "REJECT", name
+    for name, events in STRICT_LEAKS_3.items():
+        assert strict_events(*events) == "REJECT", name
+
+
+def test_a_hook_error_fails_closed():
+    gate = GateHooks(home="/home/u", strict_reads=True)
+    drive(gate.post_tool_use(_E("/p/a.cfg"), None, None))
+    drive(gate.post_tool_use(_R("/p/a.cfg"), None, None))
+    gate._mutate = None                  # any internal error in the hook
+    drive(gate.post_tool_use(_bash("sed -i s/1/2/ a.cfg"), None, None))
+    drive(gate.post_tool_use(_R("/p/x"), None, None))
+    assert drive(gate.stop(STOP, None, None)) != {}
 
 
 def test_declared_programs_run_free():
@@ -403,7 +501,7 @@ def test_a_tool_free_turn_stays_exempt():
 
 
 def test_strict_review_traps_are_accepted():
-    for name, events in STRICT_TRAPS.items():
+    for name, events in list(STRICT_TRAPS.items()) + list(STRICT_TRAPS_3.items()):
         assert strict_events(*events) == "ACCEPT", name
 
 

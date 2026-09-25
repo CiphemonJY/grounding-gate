@@ -342,6 +342,11 @@ changed this turn, after its last change and after the last shell command.
   changed anything. A subagent's changes count like the agent's own.
 - A background command stays owed, across turns too, until `BashOutput`
   reports it finished or `KillShell` stops it; what it wrote is owed then.
+- A Read that Claude Code cut short (its response says fewer lines than
+  the file has) doesn't verify, and neither does a repo script named like
+  a system program (`script/test`, `./cat`): only `/bin`, `/usr/bin` and
+  similar paths name the system program.
+- A hook that raises an error fails closed: the turn ends unverified.
 - The price, measured by the benchmark: it blocks 51% of the benchmark's
   honest transcripts (the ones that verify through shell or search);
   moving or deleting a changed file ends the turn unverified; so does a

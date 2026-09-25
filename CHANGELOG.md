@@ -60,6 +60,41 @@
   The benchmark still shows 0 strict leaks. Strict mode blocks 51.0% of
   honest transcripts, or 49.6% with `pytest` declared. The four fuzzers
   find 0 leaks in 240,000 more sessions.
+- A third adversarial review found 18 more leak classes, 1 crash (deeply
+  nested wrappers hit Python's recursion limit) and a quadratic case; all
+  are fixed and pinned in `tests/test_strict_reads.py`:
+  - A path to a program names the system program only in `/bin`,
+    `/usr/bin` and the like: `script/test` or `./pytest` stays unmodelled
+    (and isn't matched by `strict_trusted_programs`).
+  - A glob `mv`, a relative MCP write or move, `cp`/`mv`/`install`/`rsync`
+    backups, `cp --parents` and glob copy destinations can't be placed.
+  - A Read whose response shows fewer lines than the file doesn't verify.
+  - Where a Bash command started is worked out from the previous `cwd`
+    (the hook may report where it ended); with none known, a command that
+    changes directory can't be placed. `UserPromptSubmit` now records the
+    turn's starting `cwd`, and subagents are tracked separately.
+  - Failed and interrupted commands relax nothing.
+  - `wget -o`/`-a`/`--save-cookies`, curl option bundles (`-sSoout.json`),
+    GNU long-option prefixes (`sed --in`, `sort --out`), sed `wFILE`,
+    `time -o`, gawk `@include "inplace"`, `trap`, `git -c`,
+    `git grep -O`, `rg --pre` and `file -C` are owed or unmodelled.
+  - A background job counts as finished only when the response's own
+    `status` field says so, and it gates even a tool-free turn.
+  - A `cd` in a `case` arm, or behind `[ x ] &&`, leaves the directory
+    uncertain for later lists; an `if` inside `{ }` is conditional;
+    `mv -u`/`--update` may not move.
+  - Only real devices are harmless redirect targets (not `/dev/shm/...`),
+    and a file operand named `done` or `fi` is kept.
+  - Wrappers unwrap in a loop with a depth cap, and relaxing temp files
+    stops past 64 new files in one command.
+  - A hook that raises fails closed: the turn ends unverified.
+  - No longer blocked: `cd x && write` when the hook reports the new
+    cwd, `curl -sSLo f`, `wget -qO- | ...`, `install -m 644`, jobs
+    collected by `wait`, `[[ a > b ]]`.
+
+  The four fuzzers find 0 leaks in 330,000 more sessions, and there are
+  0 crashes in 94,000 malformed inputs. Strict cost is unchanged: 51.0%,
+  or 49.6% with `pytest` declared.
 - Both modes: MCP `move_file` owes its destination; `create_directory`
   owes nothing; `git checkout -- f`, `git restore f`, `truncate`, `dd of=`,
   `sponge`, `curl -o`, `wget -O`, `install`, `rsync`, `ruby -i`, and

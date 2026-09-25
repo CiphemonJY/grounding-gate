@@ -235,6 +235,8 @@ class GateState:
                 path, alt, how = eff[1], eff[2], eff[3]
                 if not path.startswith("/") and not path.startswith(shell.UNPLACED):
                     path = shell.UNPLACED + path      # no cwd: can't be placed
+                if alt and not alt.startswith("/"):
+                    alt = None                   # nor can its other reading
                 if how == "dir" and alt:
                     # b or b/a: only one can be a readable file, so either pays
                     self._owe(path, alt)
@@ -251,18 +253,25 @@ class GateState:
                     self._owe(shell.UNPLACED + "files moved by a failed command", None)
             elif failed:
                 continue           # a remove may not have run: relax nothing
+            elif kind == "move" and eff[3] == "*glob*":
+                # files that already existed land there too: which ones?
+                self._owe(shell.UNPLACED + "files moved by a glob into " + eff[2],
+                          None)
+                if eff[4] and len(created) <= _RELAX_LIMIT:
+                    for e in list(created):
+                        if _removes_path({eff[1]}, e, recursive=False):
+                            self._drop(e)
+                            created.pop(e)
+            elif kind == "move" and not (eff[2].startswith("/") and
+                                         (not eff[3] or eff[3].startswith("/"))):
+                self._owe(shell.UNPLACED + "move to " + eff[2], None)
+            elif len(created) > _RELAX_LIMIT and kind in ("remove", "move"):
+                if kind == "move":
+                    self._owe(eff[2], eff[3])      # too many to relax: owe all
             elif kind == "remove" and eff[3]:
                 for e in _removed({eff[1]}, set(created), eff[2]):
                     self._drop(e)
                     created.pop(e, None)
-            elif kind == "move" and eff[4] and eff[3] == "*glob*":
-                for e in list(created):
-                    if _removes_path({eff[1]}, e, recursive=False):
-                        self._drop(e)
-                        created.pop(e)
-                        new = posixpath.join(eff[2], posixpath.basename(e))
-                        self._owe(new, None)
-                        created[new] = None
             elif kind == "move" and eff[4]:
                 src, dst, alt = eff[1], eff[2], eff[3]
                 for e in [e for e in created if surface_hits({src}, {e})]:
@@ -620,6 +629,10 @@ def mutation_targets(args, surface, cwd=""):
     if isinstance(args, (list, tuple)):
         return {t for a in args for t in mutation_targets(a, surface, cwd)}
     return set()
+
+
+# past this many files new in one command, stop relaxing (it's quadratic)
+_RELAX_LIMIT = 64
 
 
 def _trusted(argv, trusted_programs):
