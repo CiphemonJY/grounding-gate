@@ -524,7 +524,8 @@ shell_read_operands = shell.read_operands
 
 
 def shell_write_targets(command):
-    return {e[1] for e in shell.effects(command) or [] if e[0] == "write"}
+    return {e[1] for e in shell.effects(command) or []
+            if e[0] == "write" and not e[1].startswith(shell.UNPLACED)}
 
 
 def test_surface_hits_resolve_dotdot():

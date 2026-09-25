@@ -1,5 +1,177 @@
 # Changelog
 
+## Unreleased
+
+- **Task classification for review** (`grounding_gate.classification`):
+  every finished turn is classified against a versioned standard
+  (`GG-TASK-1`). The standard has 8 categories and 10 risk flags, each with
+  a definition, a base risk and a reviewer checklist.
+  - A zero-token structural classifier works from the files changed, the
+    commands run and the gate's verdict.
+  - An optional classifier-model auditor (`LLMClassificationAuditor`) can
+    only escalate: add flags, raise the risk tier, or send the turn to human
+    review on a disagreement or a failure.
+  - The adapter exposes `last_classification`, `on_task_classified`,
+    `task_auditor`, `audit_min_risk` and `task_standard`.
+  - `render_review` prints a reviewer card.
+  - Checked by `tests/test_classification.py`: 24 labelled turns, the audit
+    merge rules, the auditor against a fake client, and the adapter wiring.
+    The auditor's request was also checked offline through the real SDK.
+- **Strict reads** (`GateHooks(strict_reads=True)`): a claim of change is
+  accepted only after a direct file read (`Read`, `NotebookRead`, an MCP
+  `read_file`-style tool) of every file changed this turn, taken after its
+  last change and after the last shell command. The shell parser may add
+  obligations but never relax one: every Bash call re-owes the turn's
+  changed files plus whatever it writes (at every place a `cd x;` may have
+  left it); nothing it prints counts as a read; its moves and deletes only
+  apply to files it created itself; a write it can't place blocks
+  verification. A parser mistake can therefore only block honest work,
+  never pass an unbacked claim. Grep, listings and web tools can ground an
+  answer but never verify a change. Checked by `tests/test_strict_reads.py`
+  (every leak from the three reviews rejected; a property test against an
+  independent oracle of the rule) and by the benchmark (0 leaking families;
+  it blocks about half of the benchmark's honest transcripts, which verify
+  through shell or search).
+- Strict reads was then reviewed adversarially (14 leak classes, 5 traps,
+  0 crashes; all reproduced, fixed and pinned in
+  `tests/test_strict_reads.py`): unclassified tools block verification
+  until declared (new `neutral_tools`); subagent changes and `Task` count;
+  a background Bash blocks; partial, multi-file and untrusted-MCP reads
+  don't verify (new `trusted_mcp_servers`); glob, unparseable and
+  unplaceable writes block; parsed `rm`/`mv` relax only files the same
+  command newly created, and only when they certainly ran (no `||`, `if`,
+  `&`, `mv -n`); an ambiguous `cp a b`/`mv t out` may be paid at either
+  place. Three fuzzers with independent oracles now find 0 leaks in
+  146,567 random sessions.
+- A second adversarial review of strict reads found 13 more leak classes
+  (0 traps beyond the declared costs, 0 crashes); all are fixed and pinned
+  in `tests/test_strict_reads.py`:
+  - A program whose writes the parser doesn't model (`xargs`, `find -exec`,
+    `bash -c`, `eval`, `git checkout f`, `git apply`/`pull`/`reset`,
+    `tar -x`, `ln`, formatters, scripts) now blocks verification, unless
+    it is declared in the new `strict_trusted_programs` (e.g. `"pytest"`,
+    `"npm test"`).
+  - `timeout`, `nice`, `stdbuf`, `ionice` are seen through (in both modes).
+  - sed backups (`-i.bak`, `-ie`, `--in-place=.orig`), sed's `w`/`e`
+    commands, brace expansion, `[x]` globs and curl's cookie/header files
+    are owed.
+  - A `&&` stage counts as run only in the command's last list, and a
+    failed command relaxes nothing.
+  - A subagent's commands are placed in its own directory; a turn where
+    only a subagent acted is gated; a subagent's read never verifies.
+  - Writes by untrusted MCP servers block; an MCP read verifies only with
+    an absolute path, one file, on a server named unambiguously.
+  - A failed write owes its target.
+  - A background command stays owed across turns until `BashOutput`
+    reports it finished or `KillShell` stops it.
+  - `NotebookRead` of one cell is partial, and a `Read` with extra path
+    keys doesn't verify.
+  - A `case` pattern's `)` no longer ends a subshell, and a `cd` inside a
+    piped group, loop or branch no longer pins the directory.
+  - An MCP move destination with no cwd can't be paid.
+  - A Bash whose hook `cwd` differs from the previous one is placed at
+    both directories.
+
+  The benchmark still shows 0 strict leaks. Strict mode blocks 51.0% of
+  honest transcripts, or 49.6% with `pytest` declared. The four fuzzers
+  find 0 leaks in 240,000 more sessions.
+- A third adversarial review found 18 more leak classes, 1 crash (deeply
+  nested wrappers hit Python's recursion limit) and a quadratic case; all
+  are fixed and pinned in `tests/test_strict_reads.py`:
+  - A path to a program names the system program only in `/bin`,
+    `/usr/bin` and the like: `script/test` or `./pytest` stays unmodelled
+    (and isn't matched by `strict_trusted_programs`).
+  - A glob `mv`, a relative MCP write or move, `cp`/`mv`/`install`/`rsync`
+    backups, `cp --parents` and glob copy destinations can't be placed.
+  - A Read whose response shows fewer lines than the file doesn't verify.
+  - Where a Bash command started is worked out from the previous `cwd`
+    (the hook may report where it ended); with none known, a command that
+    changes directory can't be placed. `UserPromptSubmit` now records the
+    turn's starting `cwd`, and subagents are tracked separately.
+  - Failed and interrupted commands relax nothing.
+  - `wget -o`/`-a`/`--save-cookies`, curl option bundles (`-sSoout.json`),
+    GNU long-option prefixes (`sed --in`, `sort --out`), sed `wFILE`,
+    `time -o`, gawk `@include "inplace"`, `trap`, `git -c`,
+    `git grep -O`, `rg --pre` and `file -C` are owed or unmodelled.
+  - A background job counts as finished only when the response's own
+    `status` field says so, and it gates even a tool-free turn.
+  - A `cd` in a `case` arm, or behind `[ x ] &&`, leaves the directory
+    uncertain for later lists; an `if` inside `{ }` is conditional;
+    `mv -u`/`--update` may not move.
+  - Only real devices are harmless redirect targets (not `/dev/shm/...`),
+    and a file operand named `done` or `fi` is kept.
+  - Wrappers unwrap in a loop with a depth cap, and relaxing temp files
+    stops past 64 new files in one command.
+  - A hook that raises fails closed: the turn ends unverified.
+  - No longer blocked: `cd x && write` when the hook reports the new
+    cwd, `curl -sSLo f`, `wget -qO- | ...`, `install -m 644`, jobs
+    collected by `wait`, `[[ a > b ]]`.
+
+  The four fuzzers find 0 leaks in 330,000 more sessions, and there are
+  0 crashes in 94,000 malformed inputs. Strict cost is unchanged: 51.0%,
+  or 49.6% with `pytest` declared.
+- A fourth adversarial review found 16 more leak classes (7 medium,
+  9 low), an exponential-time regex, 4 traps and a minor crash. For the
+  riskiest parts strict mode now allowlists instead of pattern-matching:
+  - sed scripts are checked by a linear, command-by-command parser (it
+    catches every real writer in 9,000 scripts compared with GNU sed
+    `--sandbox`), and sed options are read getopt-style.
+  - `cp`/`mv`/`install`/`rsync` accept only understood options (a bundled
+    `-t`, `--target-dir`, `--back` or a remote path can't be placed).
+  - awk strings no longer hide `print > file`; in strict mode awk is a
+    viewer only without `>`, `|`, `@` or `system`/`getline`.
+  - curl/wget option abbreviations are unplaced.
+  - `git -c` (with any subcommand), risky environment assignments
+    (`GIT_*`, `PAGER`, `PATH`, `LD_*`, `*_COMMAND`, including `export`),
+    shell functions, `cd` in loops, `cd x || y`, `exit` mid-command, deep
+    substitutions and `touch` are covered; `*` no longer matches dotfiles;
+    an unplaced entry is never paid by a file named like it; `wait` in a
+    subshell doesn't collect the parent's jobs; `/dev/stdin` and `> -`
+    are writes.
+  - Claude Code's `TaskOutput`/`TaskStop` finish background jobs;
+    `cd x || exit`, `set -e; cd x`, rsync, `uniq` and read-only git
+    subcommands no longer block. Stop and UserPromptSubmit fail safe.
+
+  fuzz7 (with 75 new realistic templates) finds 0 leaks in 120,000
+  sessions, and the older fuzzers find 0 in 160,000 more. The cd fuzzers
+  run against real bash and find 0 leaks.
+- A fifth adversarial review found 15 more leak classes (6 medium, 9 low),
+  a quadratic brace check and no new traps in common workflows. The areas
+  that were still modelled by assumption now use allowlists or conservative
+  defaults:
+  - A background `&` on a list, pipeline, group or loop (or inside a
+    substitution) is unplaced, not just its last command.
+  - Only a plain, literal `rm`/`mv` releases a temp file. Not `git rm`,
+    `rmdir`, `unlink`, globs, trailing slashes, `$'…'` words, or anything
+    after `set -f`/`GLOBIGNORE`.
+  - The sed lexer matches GNU for `r`/`R` filenames, labels and comments.
+  - awk accepts only `-F` and `-v`.
+  - Environment variables passed to a command must be on a harmless
+    allowlist (strict mode); `export NAME` without a value is checked too.
+  - `curl -w %output`, `wget --config`, `sort --compress-program`, git
+    `--upload-pack`/`--exec`, `alias`, `hash -p`, `set -a`, `${x@P}` and
+    code stored in variables are unplaced.
+  - `cd`/`pushd`/`popd` are followed only in their plain form. `set +e`
+    ends errexit. `cd x || (exit)` doesn't pin the directory.
+  - Operands after `--` are kept, and `cp -s`/`-l` are no longer allowed.
+  - A directory copy (`cp -r src/ dst/`) says to read the files inside.
+  - Version checks, `date` and `git stash list` no longer block.
+  - The tokenizer's fast path makes a 13 KB command take 0.04 s, down
+    from 0.17 s.
+
+  The review fuzzers find 0 leaks in 245,000 sessions. The sed fuzzer,
+  checked against real GNU sed, finds no missed writers in 30,000 scripts.
+  There are 0 crashes in 100,000 random inputs.
+- Both modes: MCP `move_file` owes its destination; `create_directory`
+  owes nothing; `git checkout -- f`, `git restore f`, `truncate`, `dd of=`,
+  `sponge`, `curl -o`, `wget -O`, `install`, `rsync`, `ruby -i`, and
+  `/usr/bin/sed`/`gsed`/`busybox sed` are recorded as writes; `filepath`,
+  `target_file` and `paths` are path keys.
+- Writes inside command substitutions (`x=$(sed -i ... f)`, backticks) are
+  owed in both modes; `awk -i inplace` and `perl -i` are recorded as
+  writes; `sort -uo F` bundles are seen; after `cd x;` a write is owed at
+  both possible places.
+
 ## 0.5.0 — 2026-09-25
 
 Minor version because verification is stricter: every edited file must be

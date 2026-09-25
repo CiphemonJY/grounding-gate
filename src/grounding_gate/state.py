@@ -58,6 +58,9 @@ class GateState:
     pending_verification: set = field(default_factory=set)
     # owed entry -> the other path that also pays it (an ambiguous `mv a b`)
     pending_aliases: dict = field(default_factory=dict)
+    # every file changed this turn; strict reads owes them all again after
+    # any shell command (it may have changed them). Reset with the turn.
+    changed_this_turn: set = field(default_factory=set)
     # per-turn latches
     grounded_this_turn: bool = False
     verified_this_turn: bool = False
@@ -96,7 +99,8 @@ class GateState:
                 "budget meaningless" % (refill, cap))
         return cls(budget=cap, cap=cap, refill=refill, **kw)
 
-    def note_mutation(self, args, cwd="", output="", failed=False, home=None):
+    def note_mutation(self, args, cwd="", output="", failed=False, home=None,
+                      strict=False, trusted_programs=()):
         """Record a mutating call at ``current_step``.
 
         A completion now needs a fresh read AFTER this step, earlier
@@ -114,28 +118,59 @@ class GateState:
         self.verified_this_turn = False
         command = args.get("command") if isinstance(args, dict) else None
         if not isinstance(command, str):
+            if failed and strict:
+                # it may have written part of its target: owe what it names
+                targets = {t if t.startswith("/") else UNPLACED + t
+                           for t in path_values(args)} or {UNPLACED + "unnamed target"}
+                for t in targets:
+                    self._owe(t, None)
+                self.changed_this_turn |= targets
+                self.claim_surface |= mutation_identifiers(args)
+                return
             if failed:
                 # it may have partly happened, so a read of it is relevant
                 # (and required: verification was just reset), but it isn't
                 # owed: the file may not exist, and then no read could pay
                 self.claim_surface |= mutation_identifiers(args)
                 return
-            self.pending_verification |= mutation_targets(args, self.claim_surface, cwd)
-            self.claim_surface |= mutation_identifiers(args)
+            targets = mutation_targets(args, self.claim_surface, cwd)
             src, dst = (args.get("source"), args.get("destination")) \
                 if isinstance(args, dict) else (None, None)
-            if isinstance(src, str) and isinstance(dst, str):
-                self._move(_under(cwd, src), _under(cwd, dst), None)
+            moved = isinstance(src, str) and isinstance(dst, str)
+            if strict:
+                # a target that isn't an absolute path could be anywhere
+                targets = {t if t.startswith("/") else UNPLACED + t for t in targets}
+                if not targets and not moved:
+                    targets = {UNPLACED + "unnamed target"}
+            self.pending_verification |= targets
+            self.changed_this_turn |= targets
+            self.claim_surface |= mutation_identifiers(args)
+            if moved:
+                src, dst = _under(cwd, src), _under(cwd, dst)
+                if strict and not dst.startswith("/"):
+                    dst = UNPLACED + dst          # no cwd: can't be placed
+                if not strict:
+                    self._move(src, dst, None)
+                # the destination now holds content that wasn't read there
+                self.pending_verification.add(dst)
+                self.changed_this_turn.add(dst)
+                self.claim_surface.add(dst)
             return
         from . import shell
-        effs = shell.effects(command, cwd, output, home)
+        effs = shell.effects(command, cwd, output, home, strict)
+        if strict:
+            self._note_shell_strictly(effs, failed, trusted_programs)
+            return
         if effs is None:
             return                     # unparseable: freshness still applies
         for eff in effs:
             kind = eff[0]
+            if kind == "write" and eff[1].startswith(shell.UNPLACED):
+                continue       # can't be placed: freshness is all we can ask
             if kind == "write":
                 # a failed command may have stopped anywhere, but what it
                 # wrote before failing is still changed: owe it
+                self.changed_this_turn.add(eff[1])
                 self.pending_verification.add(eff[1])
                 self.claim_surface.add(eff[1])
                 if eff[2]:
@@ -150,7 +185,7 @@ class GateState:
             elif kind == "move" and eff[3] == "*glob*":
                 self._move_glob(eff[1], eff[2])
             elif kind == "move":
-                self._move(*eff[1:])
+                self._move(*eff[1:4])
             elif kind == "read":
                 for e in self._owed_hits({eff[1]}):
                     self._drop(e)
@@ -166,13 +201,119 @@ class GateState:
             self.verified_this_turn = True
             self.last_verification_step = self.current_step
 
+    def _note_shell_strictly(self, effs, failed=False, trusted_programs=()):
+        """Strict reads: the shell parser may ADD obligations, never relax
+        one.
+
+        Any command is an unknown change, so every file changed earlier this
+        turn is owed again, and everything it writes is owed: at both places
+        when a ``cd x;`` left its directory uncertain, and as an unpayable
+        entry when it can't be placed at all (so the turn ends unverified).
+        The one relaxation: a file this same command newly created may be
+        moved or deleted by a later part of it that certainly ran (no
+        ``||``, ``if`` or ``&``, no ``mv -n``), which is the temp-file idiom
+        (``jq ... > tmp && mv tmp f``). Nothing it printed counts as a read.
+        A program whose writes the parser doesn't model (a script, a
+        build, ``xargs``, ``git checkout``) owes an unpayable entry unless
+        ``trusted_programs`` declares it (``"pytest"``, ``"npm test"``). A
+        failed command may have stopped anywhere: nothing is relaxed. An
+        unparseable command owes an unpayable entry.
+        """
+        from . import shell
+        self.pending_verification |= self.changed_this_turn
+        if effs is None:
+            effs = [("write", shell.UNPLACED + "unparsed command", None, None)]
+        created = {}                 # path -> alias, files new in this command
+        for eff in effs:
+            kind = eff[0]
+            if kind == "opaque":
+                if not _trusted(eff[1], trusted_programs):
+                    self._owe(shell.UNPLACED + "unmodelled command %s (declare it "
+                              "in strict_trusted_programs if it writes no files)"
+                              % " ".join(eff[1][:2]), None)
+            elif kind == "write":
+                path, alt, how = eff[1], eff[2], eff[3]
+                if not path.startswith("/") and not path.startswith(shell.UNPLACED):
+                    path = shell.UNPLACED + path      # no cwd: can't be placed
+                if alt and not alt.startswith("/"):
+                    alt = None                   # nor can its other reading
+                if how == "dir" and alt:
+                    # b or b/a: only one can be a readable file, so either pays
+                    self._owe(path, alt)
+                    if path not in self.changed_this_turn:
+                        created[path] = alt
+                else:
+                    for place in filter(None, (path, alt)):
+                        self._owe(place, None)
+                        if place not in self.changed_this_turn:
+                            created[place] = None
+            elif failed and kind == "move":
+                self._owe(eff[2], eff[3] if eff[3] != "*glob*" else None)
+                if eff[3] == "*glob*":
+                    self._owe(shell.UNPLACED + "files moved by a failed command", None)
+            elif failed:
+                continue           # a remove may not have run: relax nothing
+            elif kind == "move" and eff[3] == "*glob*":
+                # files that already existed land there too: which ones?
+                self._owe(shell.UNPLACED + "files moved by a glob into " + eff[2],
+                          None)
+                if eff[4] and len(created) <= _RELAX_LIMIT:
+                    for e in list(created):
+                        if _removes_path({eff[1]}, e, recursive=False):
+                            self._drop(e)
+                            created.pop(e)
+            elif kind == "move" and not (eff[2].startswith("/") and
+                                         (not eff[3] or eff[3].startswith("/"))):
+                self._owe(shell.UNPLACED + "move to " + eff[2], None)
+            elif len(created) > _RELAX_LIMIT and kind in ("remove", "move"):
+                if kind == "move":
+                    self._owe(eff[2], eff[3])      # too many to relax: owe all
+            elif kind == "remove" and eff[3]:
+                for e in _removed({eff[1]}, set(created), eff[2]):
+                    self._drop(e)
+                    created.pop(e, None)
+            elif kind == "move" and eff[4]:
+                src, dst, alt = eff[1], eff[2], eff[3]
+                for e in [e for e in created if surface_hits({src}, {e})]:
+                    self._drop(e)
+                    created.pop(e)
+                # the destination holds content nobody read there
+                self._owe(dst, alt)
+                if dst not in self.changed_this_turn:
+                    created[dst] = alt
+            elif kind == "move":
+                self._owe(eff[2], eff[3])     # uncertain move: owe, drop nothing
+        self.changed_this_turn |= set(created)
+        self.changed_this_turn |= {e for e in self.pending_verification}
+
+    def _owe(self, path, alias):
+        self.pending_verification.add(path)
+        self.claim_surface.add(path)
+        if alias:
+            self.pending_aliases[path] = alias
+            self.claim_surface.add(alias)
+
+    def note_unknown_change(self, targets=()):
+        """Strict reads: a tool the gate can't classify (or a subagent's
+        change) may have changed anything already changed this turn, so all
+        of it is owed again; named targets are owed too."""
+        self.last_mutation_step = self.current_step
+        self.verified_this_turn = False
+        self.pending_verification |= self.changed_this_turn
+        for t in targets:
+            self._owe(t, None)
+            self.changed_this_turn.add(t)
+
     def _drop(self, entry):
         self.pending_verification.discard(entry)
         self.pending_aliases.pop(entry, None)
 
     def _owed_hits(self, idents):
-        """Owed entries ``idents`` pay: the entry's path, or its alias."""
-        hits = surface_hits(idents, self.pending_verification)
+        """Owed entries ``idents`` pay: the entry's path, or its alias. An
+        unplaced entry is paid by nothing (not a file named like it)."""
+        idents = {i for i in idents if UNPLACED not in str(i)}
+        hits = surface_hits(idents, {e for e in self.pending_verification
+                                     if not e.startswith(UNPLACED)})
         by_alias = {a: e for e, a in self.pending_aliases.items()
                     if e in self.pending_verification}
         hits |= {by_alias[a] for a in surface_hits(idents, set(by_alias))}
@@ -423,8 +564,12 @@ def _tails(path):
     return frozenset("/".join(parts[k:]) for k in range(1, len(parts)))
 
 
+# prefix of an obligation no read can pay (mirrors shell.UNPLACED)
+UNPLACED = "<unplaced write> "
+
 # tool_input keys whose VALUES name what was touched
-_PATH_KEYS = ("file_path", "path", "notebook_path", "filename", "file")
+_PATH_KEYS = ("file_path", "path", "notebook_path", "filename", "file",
+              "filepath", "filePath", "target_file", "targetFile", "paths")
 
 
 def path_values(tool_input):
@@ -433,8 +578,14 @@ def path_values(tool_input):
     would make different files alias each other."""
     if not isinstance(tool_input, dict):
         return set()
-    return {str(v) for k, v in tool_input.items()
-            if k in _PATH_KEYS and isinstance(v, (str, int, float)) and str(v)}
+    out = set()
+    for k, v in tool_input.items():
+        if k not in _PATH_KEYS:
+            continue
+        for item in (v if isinstance(v, (list, tuple)) else [v]):
+            if isinstance(item, (str, int, float)) and str(item):
+                out.add(str(item))
+    return out
 
 
 def mutation_identifiers(tool_input):
@@ -483,6 +634,20 @@ def mutation_targets(args, surface, cwd=""):
     return set()
 
 
+# past this many files new in one command, stop relaxing (it's quadratic)
+_RELAX_LIMIT = 64
+
+
+def _trusted(argv, trusted_programs):
+    """Whether ``argv`` starts with one of the declared programs (each a
+    name, or a name and its leading words: ``"npm test"``)."""
+    for entry in trusted_programs:
+        words = tuple(entry.split())
+        if words and tuple(argv[:len(words)]) == words:
+            return True
+    return False
+
+
 def _under(cwd, path):
     return path if path.startswith("/") or not cwd else posixpath.join(cwd, path)
 
@@ -504,6 +669,15 @@ def _removed(operands, pending, recursive=True, aliases=None):
     return hits
 
 
+def _glob_match(parts, pattern):
+    """The shell's glob, part by part: ``*`` doesn't match a leading dot
+    (``rm -rf out/*`` leaves ``out/.env``)."""
+    pats = pattern.strip("/").split("/")
+    return len(parts) == len(pats) and all(
+        fnmatch.fnmatchcase(part, pat) and (not part.startswith(".") or pat.startswith("."))
+        for part, pat in zip(parts, pats))
+
+
 def _removes_path(operands, path, recursive):
     cpath = _canonical(path)
     for operand in operands:
@@ -512,11 +686,10 @@ def _removes_path(operands, path, recursive):
             parts = cpath.strip("/").split("/")
             depth = op.strip("/").count("/") + 1
             if op.startswith("/") and cpath.startswith("/"):
-                if len(parts) >= depth and fnmatch.fnmatchcase(
-                        "/" + "/".join(parts[:depth]), op) and (
+                if len(parts) >= depth and _glob_match(parts[:depth], op) and (
                         len(parts) == depth or recursive):
                     return True
-            elif fnmatch.fnmatchcase("/".join(parts[-depth:]), op.lstrip("/")):
+            elif len(parts) >= depth and _glob_match(parts[-depth:], op):
                 return True
             continue
         if surface_hits({operand}, {path}):

@@ -1471,12 +1471,17 @@ def _drive(coro):
     raise RuntimeError("hook awaited something; run it under asyncio instead")
 
 
-def sdk_verdict(events, surface):
+def sdk_verdict(events, surface, strict=False, trusted=()):
     """Replay hook events through GateHooks; the LAST stop decides."""
     from grounding_gate.adapters.claude_agent_sdk import GateHooks
-    gate = GateHooks(claim_surface=surface)
+    gate = GateHooks(claim_surface=surface, strict_reads=strict,
+                     strict_trusted_programs=trusted)
     hook = {"tool": gate.post_tool_use, "fail": gate.post_tool_use_failure,
             "prompt": gate.user_prompt_submit, "stop": gate.stop}
+    # a real session's turn opens with UserPromptSubmit, which carries the
+    # working directory the first command starts in
+    _drive(gate.user_prompt_submit(
+        {"hook_event_name": "UserPromptSubmit", "cwd": ROOT}, None, None))
     out = None
     for kind, data in events:
         out = _drive(hook[kind](data, None, None))
@@ -1552,9 +1557,49 @@ def main(argv=None):
     print("all %d families: structural %.2f%%, including semantic pairs %.2f%%"
           % (len(everything), 100 * error_rate(everything),
              100 * error_rate(everything, semantic=True)))
-    if args.max_error is not None and worst > args.max_error:
+    leaks, cost = strict_report(args.n)
+    if args.max_error is not None and (worst > args.max_error or leaks):
         return 1
     return 0
+
+
+def strict_report(n):
+    """Every SDK family again with ``GateHooks(strict_reads=True)``.
+
+    Strict mode's promise is one-sided: it may block honest work that only
+    a shell command or a search verified (its cost, by design), but it must
+    never accept a claim a reject-labelled family says is unbacked. Returns
+    ``(leaking families, cost)``, where cost is the share of accept-labelled
+    transcripts strict mode blocks, first with no program declared, then
+    with the test runner declared (``strict_trusted_programs``).
+    """
+    sets = [FAMILIES, HELDOUT, HELDOUT2, HELDOUT3, HELDOUT4, HELDOUT5, HELDOUT6,
+            HELDOUT7, HELDOUT8, HELDOUT9, HELDOUT10, HELDOUT11, HELDOUT12]
+    leaks, costs = [], []
+    for trusted in ((), ("pytest",)):
+        blocked, accepts = 0, 0
+        for families in sets:
+            for fam, label in families:
+                if "_sdk_" not in fam.__name__ or \
+                        fam.__name__.split("_", 1)[1] in SEMANTIC:
+                    continue
+                for seed in range(n):
+                    script, surface = fam(random.Random(f"{fam.__name__}:{seed}"))
+                    got = sdk_verdict(script, surface, strict=True, trusted=trusted)
+                    if label == REJECT_LABEL and got == ACCEPT_LABEL:
+                        leaks.append(fam.__name__)
+                        break
+                    if label == ACCEPT_LABEL:
+                        accepts += 1
+                        blocked += got == REJECT_LABEL
+        costs.append(blocked / accepts if accepts else 0.0)
+    print("strict_reads: %d leaking families (must be 0); blocks %.1f%% of "
+          "honest transcripts (the cost of trusting only direct reads), "
+          "%.1f%% with pytest declared in strict_trusted_programs"
+          % (len(leaks), 100 * costs[0], 100 * costs[1]))
+    for name in sorted(set(leaks)):
+        print("  LEAK in strict mode:", name)
+    return leaks, costs[0]
 
 
 if __name__ == "__main__":

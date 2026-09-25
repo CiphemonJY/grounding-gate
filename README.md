@@ -312,6 +312,134 @@ file names a document merely mentions do not. Override with
 The adapter adds no dependency: grounding-gate stays stdlib-only, and only
 `as_options_hooks()` requires `claude-agent-sdk` to be installed.
 
+## Strict reads
+
+For high-stakes runs, `GateHooks(strict_reads=True)` trusts only direct file
+reads. A claim of change is accepted only after the `Read` tool (or
+`NotebookRead`, or an MCP `read_file`-style tool) has shown every file
+changed this turn, after its last change and after the last shell command.
+
+- Shell output never counts as evidence, and every Bash call counts as a
+  possible change to everything changed so far this turn: run your tests,
+  then Read the files you changed.
+- The shell parser can only add obligations (files a command writes are
+  owed), never remove them, so a parser mistake can block honest work but
+  never let an unbacked claim through.
+- Only a whole, direct, local read verifies: not Grep, Glob or web tools;
+  not a partial read (`offset`/`limit`, `head`/`tail`); not
+  `read_multiple_files`; not an MCP read tool on a server outside
+  `trusted_mcp_servers` (default `{"filesystem", "fs"}`).
+- A write the gate can't place (a glob, a variable, an unknown directory,
+  an unparseable command, a background job still running) ends the turn
+  unverified rather than passing it.
+- So does a program whose writes the parser doesn't model: a script, a
+  build, a formatter, `xargs`, `find -exec`, `bash -c`, `git checkout`,
+  `tar -x`. Declare the ones you know write no files, by name or by name
+  and leading words: `strict_trusted_programs=("pytest", "npm test")`.
+  Their redirects (`pytest > log`) are still owed.
+- A tool the gate doesn't know blocks verification until you declare it
+  (`read_only_tools`, `neutral_tools`, `mutating_tools`): it could have
+  changed anything. A subagent's changes count like the agent's own.
+- A background command stays owed, across turns too, until `BashOutput`
+  reports it finished or `KillShell` stops it; what it wrote is owed then.
+- A Read that Claude Code cut short (its response says fewer lines than
+  the file has) doesn't verify, and neither does a repo script named like
+  a system program (`script/test`, `./cat`): only `/bin`, `/usr/bin` and
+  similar paths name the system program.
+- A hook that raises an error fails closed: the turn ends unverified.
+- For the programs whose writes it models, strict mode accepts only the
+  forms it fully understands: sed scripts are parsed command by command
+  (a `w`, `e` or unknown command, a `-f` script file or a `$VAR` script
+  can't be placed); `cp`/`mv`/`install`/`rsync` accept only options whose
+  effect on the destination is known; curl/wget abbreviations, `GIT_*`,
+  `PAGER` or `PATH` overrides, shell functions and `cd` inside loops end
+  the turn unverified.
+- In strict mode a command may only pass environment variables from a short
+  known-harmless list (`CI`, `NODE_ENV`, `LANG`, `RUST_LOG`, ...). A temp
+  file is released only by a plain, literal `rm` or `mv` that certainly ran.
+  `cd` is followed only in its plain one-operand form. A background `&` on a
+  list or group, `alias`, `hash -p` and code stored in variables all end the
+  turn unverified.
+- What no command parser can see: strict mode trusts the machine's
+  configuration. A repository's `.git/config` (`core.fsmonitor`, external
+  diff and textconv drivers), `~/.curlrc`, `~/.wgetrc` or shell start-up
+  files can make an allowed command write files. Guard those separately if
+  the agent can edit them.
+- The price, measured by the benchmark: it blocks 51% of the benchmark's
+  honest transcripts (the ones that verify through shell or search);
+  moving or deleting a changed file ends the turn unverified; so does a
+  turn that only ran commands without reading what they changed.
+
+## Task classification for review
+
+After each turn ends, the adapter sorts it into a task category from a
+written standard. Reviewers can then route and check agent work the same
+way every time. The gate decides whether the claims are backed; this layer
+tells a reviewer what kind of task it was, how risky it is, and what to check.
+
+**The standard** (`grounding_gate.classification.STANDARD`, id `GG-TASK-1`)
+is versioned. Each entry has a definition, a base risk and a reviewer
+checklist.
+
+- **Categories:** a turn gets exactly one primary category. When it touched
+  several, the first in this list wins:
+  1. `operations`
+  2. `config`
+  3. `code`
+  4. `data`
+  5. `tests`
+  6. `docs`
+  7. `execution`
+  8. `inquiry`
+- **Flags:** a turn can have any number of these: `unverified_exit`,
+  `external_effect`, `destructive`, `security_sensitive`, `ci_change`,
+  `dependency_change`, `unmodelled_commands`, `subagent_changes`,
+  `large_change` and `failed_calls`.
+- **Risk tier:** the highest base risk among the category and the flags.
+- **Human review:** high-risk turns are marked for it.
+
+**How a turn is classified:**
+
+1. **Structural classifier** (zero-token and deterministic). It uses what the
+   turn actually did: the files it changed (sorted by path into
+   code/tests/docs/config/data), the commands it ran, and the gate's verdict.
+   Each category and flag records the evidence that produced it.
+2. **Model audit** (optional). A classifier model reviews that result against
+   the same standard. The audit can only escalate:
+   - it may add flags and raise the risk tier, never remove or lower them;
+   - a different category, or an audit that failed, sends the turn to human
+     review;
+   - the structural category stays the recorded one, with the auditor's kept
+     beside it.
+
+```python
+from grounding_gate.adapters.claude_agent_sdk import GateHooks
+from grounding_gate.classification import render_review
+from grounding_gate.classification.llm import LLMClassificationAuditor
+
+gate = GateHooks(
+    task_auditor=LLMClassificationAuditor(),   # claude-opus-5, effort "low"
+    audit_min_risk="medium",                   # skip the model on low-risk turns
+    on_task_classified=lambda c, record: print(render_review(c)),
+)
+# gate.last_classification.to_dict() -> category, flags, risk, checklist,
+# evidence, needs_human_review, audit
+```
+
+**About the model auditor:**
+- **Answer format:** it asks for JSON limited to the standard's own
+  category and flag IDs (structured outputs).
+- **Untrusted input:** it fences the turn record as data the agent produced,
+  so the model is told not to follow instructions inside it.
+- **Refusals:** it opts into server-side `fallbacks: "default"`, so a refused
+  request is re-run on Anthropic's recommended fallback model. Pass
+  `fallbacks=None` on Bedrock, Vertex or Foundry.
+- **Where it runs:** in the Stop hook, so each audited turn costs one model
+  call.
+- **Setup:** install it with `pip install grounding-gate[llm]`.
+- **Turning it off:** `classify_tasks=False`.
+- **Your own standard:** pass it as `task_standard=`.
+
 ## Measuring the error rate
 
 [examples/hallucination_bench.py](https://github.com/CiphemonJY/grounding-gate/blob/main/examples/hallucination_bench.py)
