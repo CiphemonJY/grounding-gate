@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-09-25
+
+Minor version because verification is stricter: every edited file must be
+re-read, and file listings, counts, `git diff --stat`, `jq length` and
+output sent to `/dev/null` no longer verify a change. See below.
 
 - `boundary_check` now fails CLOSED on an unknown `claim_type` (raises
   `ValueError`). Previously a typo such as `"assertoin"` fell through to the
