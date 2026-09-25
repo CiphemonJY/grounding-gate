@@ -125,13 +125,25 @@ class GateState:
                 self.claim_surface |= mutation_identifiers(args)
                 return
             targets = mutation_targets(args, self.claim_surface, cwd)
+            src, dst = (args.get("source"), args.get("destination")) \
+                if isinstance(args, dict) else (None, None)
+            moved = isinstance(src, str) and isinstance(dst, str)
+            if strict:
+                # a target that isn't an absolute path could be anywhere
+                targets = {t if t.startswith("/") else UNPLACED + t for t in targets}
+                if not targets and not moved:
+                    targets = {UNPLACED + "unnamed target"}
             self.pending_verification |= targets
             self.changed_this_turn |= targets
             self.claim_surface |= mutation_identifiers(args)
-            src, dst = (args.get("source"), args.get("destination")) \
-                if isinstance(args, dict) else (None, None)
-            if isinstance(src, str) and isinstance(dst, str):
-                self._move(_under(cwd, src), _under(cwd, dst), None)
+            if moved:
+                src, dst = _under(cwd, src), _under(cwd, dst)
+                if not strict:
+                    self._move(src, dst, None)
+                # the destination now holds content that wasn't read there
+                self.pending_verification.add(dst)
+                self.changed_this_turn.add(dst)
+                self.claim_surface.add(dst)
             return
         from . import shell
         effs = shell.effects(command, cwd, output, home, strict)
@@ -162,7 +174,7 @@ class GateState:
             elif kind == "move" and eff[3] == "*glob*":
                 self._move_glob(eff[1], eff[2])
             elif kind == "move":
-                self._move(*eff[1:])
+                self._move(*eff[1:4])
             elif kind == "read":
                 for e in self._owed_hits({eff[1]}):
                     self._drop(e)
@@ -180,36 +192,82 @@ class GateState:
 
     def _note_shell_strictly(self, effs):
         """Strict reads: the shell parser may ADD obligations, never relax
-        one. Any command is an unknown change, so every file changed earlier
-        this turn is owed again; files it writes are owed too. Parsed moves
-        and removals apply only to files this same command created (a temp
-        file written then moved or deleted), so a misparse can at worst
-        block honest work, never clear a real debt. Nothing it printed
-        counts as a read."""
+        one.
+
+        Any command is an unknown change, so every file changed earlier this
+        turn is owed again, and everything it writes is owed: at both places
+        when a ``cd x;`` left its directory uncertain, and as an unpayable
+        entry when it can't be placed at all (so the turn ends unverified).
+        The one relaxation: a file this same command newly created may be
+        moved or deleted by a later part of it that certainly ran (no
+        ``||``, ``if`` or ``&``, no ``mv -n``), which is the temp-file idiom
+        (``jq ... > tmp && mv tmp f``). Nothing it printed counts as a read.
+        An unparseable command owes an unpayable entry.
+        """
+        from . import shell
         self.pending_verification |= self.changed_this_turn
-        created = set()
-        for eff in effs or ():
+        if effs is None:
+            effs = [("write", shell.UNPLACED + "unparsed command", None, None)]
+        created = {}                 # path -> alias, files new in this command
+        for eff in effs:
             kind = eff[0]
             if kind == "write":
-                # every candidate place is owed on its own (an alias would
-                # let a read of the wrong one pay); an unplaced write can
-                # never be paid, so the turn ends unverified
-                for path in filter(None, eff[1:3]):
-                    self.pending_verification.add(path)
-                    self.claim_surface.add(path)
-                    created.add(path)
-            elif kind == "remove":
-                for e in _removed({eff[1]}, created, eff[2]):
+                path, alt, how = eff[1], eff[2], eff[3]
+                if not path.startswith("/") and not path.startswith(shell.UNPLACED):
+                    path = shell.UNPLACED + path      # no cwd: can't be placed
+                if how == "dir" and alt:
+                    # b or b/a: only one can be a readable file, so either pays
+                    self._owe(path, alt)
+                    if path not in self.changed_this_turn:
+                        created[path] = alt
+                else:
+                    for place in filter(None, (path, alt)):
+                        self._owe(place, None)
+                        if place not in self.changed_this_turn:
+                            created[place] = None
+            elif kind == "remove" and eff[3]:
+                for e in _removed({eff[1]}, set(created), eff[2]):
                     self._drop(e)
-                    created.discard(e)
-            elif kind == "move" and eff[3] != "*glob*":
-                for e in created & surface_hits({eff[1]}, created):
+                    created.pop(e, None)
+            elif kind == "move" and eff[4] and eff[3] == "*glob*":
+                for e in list(created):
+                    if _removes_path({eff[1]}, e, recursive=False):
+                        self._drop(e)
+                        created.pop(e)
+                        new = posixpath.join(eff[2], posixpath.basename(e))
+                        self._owe(new, None)
+                        created[new] = None
+            elif kind == "move" and eff[4]:
+                src, dst, alt = eff[1], eff[2], eff[3]
+                for e in [e for e in created if surface_hits({src}, {e})]:
                     self._drop(e)
-                    created.discard(e)
-                    self.pending_verification.add(eff[2])
-                    self.claim_surface.add(eff[2])
-                    created.add(eff[2])
-        self.changed_this_turn |= created
+                    created.pop(e)
+                # the destination holds content nobody read there
+                self._owe(dst, alt)
+                if dst not in self.changed_this_turn:
+                    created[dst] = alt
+            elif kind == "move":
+                self._owe(eff[2], eff[3])     # uncertain move: owe, drop nothing
+        self.changed_this_turn |= set(created)
+        self.changed_this_turn |= {e for e in self.pending_verification}
+
+    def _owe(self, path, alias):
+        self.pending_verification.add(path)
+        self.claim_surface.add(path)
+        if alias:
+            self.pending_aliases[path] = alias
+            self.claim_surface.add(alias)
+
+    def note_unknown_change(self, targets=()):
+        """Strict reads: a tool the gate can't classify (or a subagent's
+        change) may have changed anything already changed this turn, so all
+        of it is owed again; named targets are owed too."""
+        self.last_mutation_step = self.current_step
+        self.verified_this_turn = False
+        self.pending_verification |= self.changed_this_turn
+        for t in targets:
+            self._owe(t, None)
+            self.changed_this_turn.add(t)
 
     def _drop(self, entry):
         self.pending_verification.discard(entry)
@@ -468,8 +526,12 @@ def _tails(path):
     return frozenset("/".join(parts[k:]) for k in range(1, len(parts)))
 
 
+# prefix of an obligation no read can pay (mirrors shell.UNPLACED)
+UNPLACED = "<unplaced write> "
+
 # tool_input keys whose VALUES name what was touched
-_PATH_KEYS = ("file_path", "path", "notebook_path", "filename", "file")
+_PATH_KEYS = ("file_path", "path", "notebook_path", "filename", "file",
+              "filepath", "filePath", "target_file", "targetFile", "paths")
 
 
 def path_values(tool_input):
@@ -478,8 +540,14 @@ def path_values(tool_input):
     would make different files alias each other."""
     if not isinstance(tool_input, dict):
         return set()
-    return {str(v) for k, v in tool_input.items()
-            if k in _PATH_KEYS and isinstance(v, (str, int, float)) and str(v)}
+    out = set()
+    for k, v in tool_input.items():
+        if k not in _PATH_KEYS:
+            continue
+        for item in (v if isinstance(v, (list, tuple)) else [v]):
+            if isinstance(item, (str, int, float)) and str(item):
+                out.add(str(item))
+    return out
 
 
 def mutation_identifiers(tool_input):

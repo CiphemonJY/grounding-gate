@@ -147,6 +147,108 @@ def test_every_review_leak_is_rejected_in_strict_mode():
         assert strict(*steps)[0] == "REJECT", name
 
 
+# ------------------------------------------ strict review findings
+
+def _ev(tool, tool_input, response="ok", cwd="/p", **extra):
+    event = ptu(tool, tool_input, response, cwd)
+    event.update(extra)
+    return event
+
+
+def strict_events(*events, surface=()):
+    gate = GateHooks(claim_surface=set(surface), home="/home/u", strict_reads=True)
+    for e in events:
+        if e["hook_event_name"] == "PostToolUse":
+            drive(gate.post_tool_use(e, None, None))
+        else:
+            drive(gate.post_tool_use_failure(e, None, None))
+    return "ACCEPT" if drive(gate.stop(STOP, None, None)) == {} else "REJECT"
+
+
+def _bash(cmd, cwd="/p", **extra):
+    return _ev("Bash", dict({"command": cmd}, **extra),
+               {"stdout": "", "stderr": "", "interrupted": False, "isImage": False}, cwd)
+
+
+def _E(p):
+    return _ev("Edit", {"file_path": p})
+
+
+def _R(p, text="c", **extra):
+    return _ev("Read", dict({"file_path": p}, **extra), text)
+
+
+STRICT_LEAKS = {
+    "L1 glob write target": (_E("/p/src/x.py"), _bash("sed -i s/a/b/ src/*.py"),
+                             _R("/p/src/x.py")),
+    "L2 conditional rm of a changed file": (
+        _E("/p/out.json"), _R("/p/out.json", "v1"),
+        _bash("python gen.py > out.json || rm -f out.json"), _E("/p/x.py"), _R("/p/x.py")),
+    "L2b mv -n may not move": (
+        _E("/p/x.py"), _bash("sed -i s/a/b/ a.cfg && mv -n a.cfg b.cfg"),
+        _R("/p/b.cfg"), _R("/p/x.py")),
+    "L3 unparseable command": (_E("/p/x.py"), _bash("cat > notes.md <<EOF\nrun `make`\nEOF"),
+                               _R("/p/x.py")),
+    "L4 subagent edit after verification": (
+        _E("/p/a.cfg"), _R("/p/a.cfg"), _ev("Task", {"prompt": "tidy"}, "done"),
+        _ev("Edit", {"file_path": "/p/a.cfg"}, agent_id="sub1")),
+    "L5 MCP move destination": (
+        _E("/p/a.cfg"), _R("/p/a.cfg"),
+        _ev("mcp__fs__move_file", {"source": "/p/c.cfg", "destination": "/p/d.cfg"}),
+        _R("/p/a.cfg", "c2")),
+    "L6 unknown tool after verification": (
+        _E("/p/a.cfg"), _R("/p/a.cfg"), _ev("ApplyPatch", {"patch": "*** Update File: a"})),
+    "L6b unknown path key": (
+        _E("/p/x.py"), _ev("mcp__x__write_file", {"filepath": "/p/z.cfg", "content": "h"}),
+        _R("/p/x.py")),
+    "L7 mv onto an existing file": (_E("/p/x.py"), _bash("mv a.cfg.orig a.cfg"), _R("/p/x.py")),
+    "L7b git checkout -- f": (_E("/p/x.py"), _bash("git checkout -- a.cfg"), _R("/p/x.py")),
+    "L7c /usr/bin/sed": (_E("/p/x.py"), _bash("/usr/bin/sed -i s/a/b/ a.cfg"), _R("/p/x.py")),
+    "L7d curl -o": (_E("/p/x.py"), _bash("curl -o a.json https://x/y"), _R("/p/x.py")),
+    "L8 cd to an unknown place": (
+        _E("/p/x.py"),
+        _bash('cd "$(git rev-parse --show-toplevel)"; sed -i s/a/b/ README.md', "/p/sub"),
+        _R("/p/sub/README.md"), _R("/p/x.py")),
+    "L9 stderr to a file": (_E("/p/x.py"), _bash("python gen.py 2> err.log"), _R("/p/x.py")),
+    "L10 background command": (
+        _E("/p/a.cfg"), _bash("sleep 60; sed -i s/a/b/ a.cfg", run_in_background=True),
+        _R("/p/a.cfg")),
+    "L11 partial read": (_E("/p/a.cfg"), _R("/p/a.cfg", "  900\t}", offset=900, limit=1)),
+    "L12 multi-file MCP read": (
+        _E("/home/u/b.cfg"),
+        _ev("mcp__fs__read_multiple_files", {"paths": ["/home/u/b.cfg"]},
+            "/home/u/b.cfg: Error - Access denied")),
+    "L13 untrusted MCP server": (_E("/p/a.cfg"), _ev("mcp__docker__read_file", {"path": "a.cfg"}, "x")),
+    "L14 no cwd": (_ev("Bash", {"command": "sed -i s/1/2/ a.cfg"}, "", cwd=None),
+                   _R("/q/a.cfg")),
+}
+
+STRICT_TRAPS = {
+    "T1 plain cp": (_bash("cp b.cfg a.cfg"), _R("/p/a.cfg")),
+    "T2 temp file moved into a directory": (
+        _bash("jq . a.json > t.json && mv t.json out"), _R("/p/out/t.json")),
+    "T3 created temp file deleted": (
+        _bash("echo '{}' > req.json && curl -d @req.json localhost && rm req.json"),
+        _E("/p/x.py"), _R("/p/x.py")),
+}
+
+
+def test_strict_review_leaks_are_rejected():
+    for name, events in STRICT_LEAKS.items():
+        assert strict_events(*events) == "REJECT", name
+
+
+def test_strict_review_traps_are_accepted():
+    for name, events in STRICT_TRAPS.items():
+        assert strict_events(*events) == "ACCEPT", name
+
+
+def test_create_directory_owes_nothing():
+    gate = GateHooks(home="/home/u", strict_reads=True)
+    drive(gate.post_tool_use(_ev("mcp__fs__create_directory", {"path": "/p/nd"}), None, None))
+    assert gate.state.pending_verification == set()
+
+
 # ------------------------------------------------------- property test
 
 FILES = ["a.cfg", "b.cfg", "c.cfg"]

@@ -17,6 +17,22 @@
   independent oracle of the rule) and by the benchmark (0 leaking families;
   it blocks 47% of the benchmark's honest transcripts, which verify through
   shell or search).
+- Strict reads was then reviewed adversarially (14 leak classes, 5 traps,
+  0 crashes; all reproduced, fixed and pinned in
+  `tests/test_strict_reads.py`): unclassified tools block verification
+  until declared (new `neutral_tools`); subagent changes and `Task` count;
+  a background Bash blocks; partial, multi-file and untrusted-MCP reads
+  don't verify (new `trusted_mcp_servers`); glob, unparseable and
+  unplaceable writes block; parsed `rm`/`mv` relax only files the same
+  command newly created, and only when they certainly ran (no `||`, `if`,
+  `&`, `mv -n`); an ambiguous `cp a b`/`mv t out` may be paid at either
+  place. Three fuzzers with independent oracles now find 0 leaks in
+  146,567 random sessions.
+- Both modes: MCP `move_file` owes its destination; `create_directory`
+  owes nothing; `git checkout -- f`, `git restore f`, `truncate`, `dd of=`,
+  `sponge`, `curl -o`, `wget -O`, `install`, `rsync`, `ruby -i`, and
+  `/usr/bin/sed`/`gsed`/`busybox sed` are recorded as writes; `filepath`,
+  `target_file` and `paths` are path keys.
 - Writes inside command substitutions (`x=$(sed -i ... f)`, backticks) are
   owed in both modes; `awk -i inplace` and `perl -i` are recorded as
   writes; `sort -uo F` bundles are seen; after `cd x;` a write is owed at

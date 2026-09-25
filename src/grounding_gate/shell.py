@@ -306,6 +306,7 @@ _PREFIXES = frozenset({"sudo", "time", "command", "nohup", "env", "builtin",
                        "if", "then", "else", "elif", "do", "while", "until",
                        "!", "{"})
 _CLOSERS = frozenset({"}", "fi", "done", "esac"})
+_CONDITIONAL = re.compile(r"(?:^|[;&|\n(]\s*)(?:if|while|until|case|for|select)\s")
 
 
 def resolve(path, cwd, home=None):
@@ -353,6 +354,9 @@ def parse(command, cwd="", home=None):
     base = posixpath.normpath(cwd) if cwd else ("" if cwd == "" else None)
     stages, saved, dirstack = Stages(), [], []
     base_alt = None
+    # `||`, `if`/`while`/`case` or a background job anywhere makes every
+    # stage's running uncertain: a successful call no longer proves it ran
+    conditional = "||" in command or bool(_CONDITIONAL.search(command))
     argv, redirects, subst = [], [], False
     expect_target, piped_in, just_closed = None, False, False
 
@@ -369,6 +373,7 @@ def parse(command, cwd="", home=None):
             stage = Stage(list(words), redirects, subst, piped, piped_in,
                           base, home, sep, base_alt)
             stage.raw = list(argv)          # with assignments, for substitutions
+            stage.certain = not conditional and sep != "&"
             stages.append(stage)
             name = words[0] if words else ""
             if name in ("cd", "pushd", "popd") and not piped and sep != "&" \
@@ -485,12 +490,24 @@ _REVISION = re.compile(r"^(?:HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD|@)(?:[~^].*)?$
                        r"\.\.|[~^]\d*$|^[0-9a-f]{7,40}$|@\{")
 
 
+_ALIASES = {"gsed": "sed", "gawk": "awk", "mawk": "awk", "nawk": "awk",
+            "ggrep": "grep", "gsort": "sort", "gcp": "cp", "gmv": "mv",
+            "grm": "rm", "python3": "python3"}
+
+
 def _program(stage):
     """``(name, args, cwd)``; git subcommands are named ``git diff`` etc.,
     with global options skipped (``-C DIR`` moves the base)."""
     argv, cwd = stage.argv, stage.cwd
+    if argv and argv[0] == "busybox":
+        argv = argv[1:]
     if not argv:
         return "", [], cwd
+    # /usr/bin/sed is sed; gsed and gawk are GNU sed and awk
+    base = posixpath.basename(argv[0]) if "/" in argv[0] else argv[0]
+    base = _ALIASES.get(base, base)
+    if base != argv[0]:
+        argv = [base] + list(argv[1:])
     if argv[0] == "git":
         k = 1
         while k < len(argv) and argv[k].startswith("-"):
@@ -974,7 +991,8 @@ def _copy_targets(name, args, cwd, home):
         sources, target = ops, target_dir
     out = []
     for s in sources:
-        if set(s) & set("*?[$`"):
+        if set(s) & set("*?$`"):
+            out.append((UNPLACED + name + " " + s, None))   # which files landed?
             continue
         inside = posixpath.join(target, posixpath.basename(s.rstrip("/")))
         if target_dir is not None or len(sources) > 1:
@@ -989,16 +1007,26 @@ def _copy_targets(name, args, cwd, home):
     return out
 
 
-def _writes(stage):
-    """``(path, alt)`` per file a stage writes: stdout/both redirects
-    (stderr logs are not the edit), ``tee`` operands, ``sed -i`` files,
-    ``sort -o``, ``cp`` destinations. Targets that can't be placed (devices,
-    process substitutions, variables) are never owed: no read could pay."""
+def _writes(stage, strict=False):
+    """``(path, alt, kind)`` per file a stage writes.
+
+    ``kind`` says what ``alt`` means: ``"dir"`` for an ambiguous destination
+    (``cp a b``: b or b/a; only one can be a readable file, so either may
+    pay), ``"cwd"`` for an uncertain directory (after ``cd x;`` the file may
+    be in either place, both real, so strict mode owes both). Stdout/both
+    redirects, ``tee``, ``sed -i``, ``sort -o``, ``awk -i inplace``,
+    ``perl``/``ruby -i``, ``truncate``, ``dd of=``, ``sponge``, ``curl -o``,
+    ``wget -O``, ``git checkout -- f``/``git restore f``, ``cp``/``install``/
+    ``rsync`` destinations; with ``strict``, redirects on any descriptor too
+    (``2> err.log``). A target that can't be placed (a variable, a glob, an
+    unknown directory, a patch's files, a download's name) comes back as
+    ``UNPLACED + text``: no read can pay it.
+    """
     name, args, cwd = _program(stage)
-    out = []
+    out, unplaced = [], []
     for fd, op, target in stage.redirects:
-        if op in (">", ">>", ">|", "&>", "&>>", ">&") and fd in ("", "1") \
-                and not _harmless_target(op, target):
+        if op in (">", ">>", ">|", "&>", "&>>", ">&", "<>") \
+                and (fd in ("", "1") or strict) and not _harmless_target(op, target):
             out.append(target)
     if name == "tee":
         out += _split_args("tee", args)[1]
@@ -1008,25 +1036,80 @@ def _writes(stage):
             out += files
     elif name == "sort":
         out += _sort_outputs(args)
-    elif name in ("awk", "gawk") and _awk_in_place(args):
+    elif name == "awk" and _awk_in_place(args):
         out += _split_args("awk", args)[1][1:]
-    elif name == "perl" and _perl_in_place(args):
+    elif name in ("perl", "ruby") and _perl_in_place(args):
         out += _perl_files(args)
+    elif name == "truncate":
+        opts, ops = _split_args("truncate", [a for a in args])
+        out += [o for o in ops if not _looks_like_size(o, args)]
+    elif name == "dd":
+        out += [a[3:] for a in args if a.startswith("of=")]
+    elif name == "sponge":
+        out += _split_args("sponge", args)[1]
+    elif name == "curl":
+        out += _option_values(args, ("-o", "--output"))
+        if any(a in ("-O", "--remote-name", "--remote-name-all") or
+               (a.startswith("-") and not a.startswith("--") and "O" in a[1:])
+               for a in args):
+            unplaced.append("curl -O")
+    elif name == "wget":
+        named = _option_values(args, ("-O", "--output-document"))
+        out += named
+        if not named and any(not a.startswith("-") for a in args):
+            unplaced.append("wget download")
+    elif name == "patch":
+        unplaced.append("patch")           # the diff names the files
+    elif name in ("git checkout", "git restore"):
+        opts, ops = _split_args(name, args)
+        flags = {f.split("=", 1)[0] for f, _ in opts}
+        if name == "git restore" and "--staged" in flags and "--worktree" not in flags \
+                and "-W" not in flags:
+            pass                           # index only
+        elif name == "git restore" or "--" in args:
+            paths = args[args.index("--") + 1:] if "--" in args else ops
+            out += paths
     placed = []
     for p in out:
-        if set(p) & set("*?[") or _harmless_target(">", p):
+        if _harmless_target(">", p):
+            continue
+        if set(p) & set("*?"):
+            placed.append((UNPLACED + p, None, None))      # a glob: which files?
             continue
         r = resolve(p, cwd, stage.home)
         alt = resolve(p, stage.cwd_alt, stage.home) if stage.cwd_alt is not None else None
         if r:
-            placed.append((r, alt if alt and alt != r else None))
+            placed.append((r, alt if alt and alt != r else None, "cwd"))
         elif alt:
-            placed.append((alt, None))
+            # the directory it moved to is unknown: owe the fallback place and
+            # an unpayable entry (it may have been written somewhere else)
+            placed.append((alt, None, None))
+            placed.append((UNPLACED + p, None, None))
         else:
-            placed.append((UNPLACED + p, None))
-    if name == "cp":
-        placed += _copy_targets(name, args, cwd, stage.home)
+            placed.append((UNPLACED + p, None, None))
+    if name in ("cp", "install", "rsync"):
+        placed += [(d, a, "dir") for d, a in _copy_targets(name, args, cwd, stage.home)]
+    placed += [(UNPLACED + u, None, None) for u in unplaced]
     return placed
+
+
+def _option_values(args, names):
+    out = []
+    for k, a in enumerate(args):
+        for n in names:
+            if a == n and k + 1 < len(args):
+                out.append(args[k + 1])
+            elif n.startswith("--") and a.startswith(n + "="):
+                out.append(a.split("=", 1)[1])
+            elif not n.startswith("--") and a.startswith(n) and len(a) > len(n):
+                out.append(a[len(n):])
+    return out
+
+
+def _looks_like_size(operand, args):
+    """truncate's -s/-r values are not files."""
+    k = args.index(operand) if operand in args else -1
+    return k > 0 and args[k - 1] in ("-s", "--size", "-r", "--reference")
 
 
 # prefix of a write the parser could not place (``cd $DIR && sed -i ... f``,
@@ -1119,14 +1202,19 @@ def _moves(stage):
         *sources, target = ops
     else:
         sources, target = ops, target_dir
+    # a no-clobber or interactive mv may not move anything
+    certain = getattr(stage, "certain", True) and not any(
+        a in ("-n", "-i", "--no-clobber", "--interactive") or (
+            a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("ni"))
+        for a in args)
     moves = []
     for s in sources:
         if set(s) & set("$`"):
             continue
-        if set(s) & set("*?["):
+        if set(s) & set("*?"):
             src, dst = resolve(s, cwd, stage.home), resolve(target, cwd, stage.home)
             if src and dst:
-                moves.append((src, dst, "*glob*"))
+                moves.append((src, dst, "*glob*", certain))
             continue
         base = posixpath.basename(s.rstrip("/"))
         inside = posixpath.join(target, base)
@@ -1140,7 +1228,7 @@ def _moves(stage):
         dst = resolve(dst, cwd, stage.home)
         alt = resolve(alt, cwd, stage.home) if alt else None
         if src and dst:
-            moves.append((src, dst, alt))
+            moves.append((src, dst, alt, certain))
     return moves
 
 
@@ -1156,11 +1244,13 @@ def _removes(stage):
         return []
     recursive = bool(_short_flags(opts) & set("rR")) or "--recursive" in flags \
         or name == "rmdir"
+    certain = getattr(stage, "certain", True) and not (
+        _short_flags(opts) & set("iI") or "--interactive" in flags)
     out = []
     for o in ops:
         r = resolve(o, cwd, stage.home)
         if r:
-            out.append((r, recursive))
+            out.append((r, recursive, certain))
     return out
 
 
@@ -1205,22 +1295,23 @@ def _inner_writes(stage, cwd, home, strict=False, depth=0):
     for text in _substitutions(stage, process=strict):
         inner = parse(text, cwd, home)
         for s in inner or ():
-            found += _writes(s)
+            found += _writes(s, strict)
             if s.subst:
                 found += _inner_writes(s, cwd, home, strict, depth + 1)
     return found
 
 
 _KNOWN_EFFECTS = frozenset({"tee", "sed", "mv", "git mv", "rm", "git rm",
-                            "unlink", "rmdir", "mkdir", "touch", "cp", "sort"})
+                            "unlink", "rmdir", "mkdir", "touch", "cp", "sort",
+                            "truncate", "sponge", "install"})
 # note: awk -i inplace and perl -i writes are recorded, but those programs
 # stay opaque (a script can do anything else too)
 
 
 def effects(command, cwd="", output="", home=None, strict=False):
     """Ordered effects of a (possibly mutating) command:
-    ``("write", path, alt)``, ``("move", src, dst, alt)``,
-    ``("remove", path, recursive)``, ``("read", path)`` for content a stage
+    ``("write", path, alt, kind)``, ``("move", src, dst, alt, certain)``,
+    ``("remove", path, recursive, certain)``, ``("read", path)`` for content a stage
     showed the agent, and ``("opaque",)`` for a stage whose writes can't be
     known (a script, a build, a substitution). None when the command can't
     be parsed."""
@@ -1239,10 +1330,13 @@ def effects(command, cwd="", output="", home=None, strict=False):
                                                 and not stage.subst)
             if not known:
                 out.append(("opaque",))
-            out += [("write",) + w for w in _writes(stage)]
+            out += [("write",) + w for w in _writes(stage, strict)]
             if stage.subst:
                 out += [("write",) + w for w in _inner_writes(stage, stage.cwd,
                                                                stage.home, strict)]
+            if strict and stage.sep == "&" and not _stage_read_only(stage):
+                # a background job keeps writing after this call returns
+                out.append(("write", UNPLACED + "background job", None, None))
             out += [("move",) + m for m in _moves(stage)]
             out += [("remove",) + r for r in _removes(stage)]
             if _stage_read_only(stage):

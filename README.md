@@ -325,10 +325,20 @@ changed this turn, after its last change and after the last shell command.
 - The shell parser can only add obligations (files a command writes are
   owed), never remove them, so a parser mistake can block honest work but
   never let an unbacked claim through.
-- Grep, Glob and web tools can ground an answer, never verify a change.
-- The price, measured by the benchmark: it blocks 47% of the benchmark's
-  honest transcripts (the ones that verify through shell or search), and
-  moving or deleting a changed file ends the turn unverified.
+- Only a whole, direct, local read verifies: not Grep, Glob or web tools;
+  not a partial read (`offset`/`limit`, `head`/`tail`); not
+  `read_multiple_files`; not an MCP read tool on a server outside
+  `trusted_mcp_servers` (default `{"filesystem", "fs"}`).
+- A write the gate can't place (a glob, a variable, an unknown directory,
+  an unparseable command, a background job still running) ends the turn
+  unverified rather than passing it.
+- A tool the gate doesn't know blocks verification until you declare it
+  (`read_only_tools`, `neutral_tools`, `mutating_tools`): it could have
+  changed anything. A subagent's changes count like the agent's own.
+- The price, measured by the benchmark: it blocks 49% of the benchmark's
+  honest transcripts (the ones that verify through shell or search);
+  moving or deleting a changed file ends the turn unverified; so does a
+  turn that only ran commands without reading what they changed.
 
 ## Measuring the error rate
 

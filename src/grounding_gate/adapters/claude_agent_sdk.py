@@ -63,7 +63,7 @@ import re
 from ..boundary import ACCEPT, boundary_check
 from ..classifier import classify_observation
 from .. import shell
-from ..state import (_PATH_KEYS, GateState, Symbol, extract_identifiers,
+from ..state import (_PATH_KEYS, UNPLACED, GateState, Symbol, extract_identifiers,
                      path_values, surface_hits)
 
 # Built-in SDK tools by consequence class. Unknown tools (MCP tools other than
@@ -88,6 +88,14 @@ DEFAULT_CONTENT_TOOLS = frozenset({"Read", "NotebookRead"})
 # shell.is_read_only) is the exception: it is treated as a read.
 DEFAULT_MUTATING_TOOLS = frozenset(
     {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
+
+# Tools that neither read nor change files (planning, questions, to-dos).
+# Strict reads treats every tool outside the known sets as a possible change.
+DEFAULT_NEUTRAL_TOOLS = frozenset(
+    {"TodoWrite", "TodoRead", "ExitPlanMode", "AskUserQuestion"})
+# MCP servers whose read tools strict reads trusts to show the LOCAL file
+# (a server named "docker" or "remote" reads somewhere else)
+DEFAULT_TRUSTED_MCP_SERVERS = frozenset({"filesystem", "fs"})
 
 UNVERIFIED_BANNER = (
     "grounding-gate: exiting UNVERIFIED — the agent finished without a "
@@ -133,7 +141,8 @@ _MCP_FILESYSTEM = {
     "directory_tree": "listing", "search_files": "listing",
     "get_file_info": "listing",
     "write_file": "mutating", "edit_file": "mutating", "move_file": "mutating",
-    "create_directory": "mutating",
+    # a new, empty directory changes no file's content
+    "create_directory": "neutral",
 }
 
 
@@ -243,8 +252,11 @@ def _absolutize(tool_input, cwd):
     /srv/proj can't be taken for /srv/proj/conf/app.cfg."""
     if not cwd or not isinstance(tool_input, dict):
         return tool_input
-    return {k: (posixpath.join(cwd, v) if k in _PATH_KEYS and isinstance(v, str)
-                and v and not v.startswith("/") else v)
+    def place(v):
+        return posixpath.join(cwd, v) if isinstance(v, str) and v \
+            and not v.startswith("/") else v
+    return {k: ([place(x) for x in v] if isinstance(v, list) else place(v))
+            if k in _PATH_KEYS else v
             for k, v in tool_input.items()}
 
 
@@ -345,7 +357,8 @@ class GateHooks:
                  max_blocks=3, gate_subagents=False,
                  normalizers=None, extractors=None,
                  verifier=None, emit_progress=False, home=None,
-                 strict_reads=False):
+                 strict_reads=False, neutral_tools=DEFAULT_NEUTRAL_TOOLS,
+                 trusted_mcp_servers=DEFAULT_TRUSTED_MCP_SERVERS):
         extractors = dict(extractors or {})
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
@@ -371,6 +384,8 @@ class GateHooks:
         self.emit_progress = emit_progress
         self.strict_reads = bool(strict_reads)
         self.content_tools = set(content_tools)
+        self.neutral_tools = set(neutral_tools)
+        self.trusted_mcp_servers = set(trusted_mcp_servers)
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
@@ -386,10 +401,14 @@ class GateHooks:
         """PostToolUse: classify the successful observation, update state."""
         if input_data.get("hook_event_name") != "PostToolUse":
             return {}
-        if input_data.get("agent_id") and not self.gate_subagents:
-            return {}
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
+        if input_data.get("agent_id") and not self.gate_subagents:
+            # a subagent's reads never reach the main agent; in strict mode
+            # its changes still count, as unknown changes
+            if self.strict_reads and not self._pure_read(tool):
+                self._unknown_change(input_data)
+            return {}
         self._note_cwd(input_data)
         tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
         output = _output_text(input_data.get("tool_response", ""))
@@ -403,6 +422,9 @@ class GateHooks:
         self.state.current_step += 1
         shell_read = self._is_shell_read(tool, tool_input)
         mcp = _mcp_class(tool)
+        if self.strict_reads and not self._classified(tool, mcp):
+            self._unknown_change(input_data, counted=True)
+            return {}
         if mcp == "content":
             self.state.extractors.setdefault(tool, _content_identifiers)
         read_only = (tool in self.read_only_tools or shell_read
@@ -423,8 +445,8 @@ class GateHooks:
                                      input_data.get("tool_response"), result)):
             # a listing shows the file exists, not what the change wrote
             obs["grounds_completion"] = False
-        if self.strict_reads and not (tool in self.content_tools or mcp == "content"):
-            # strict: only a direct file read verifies a change
+        if self.strict_reads and not self._verifying_read(tool, tool_input, mcp):
+            # strict: only a whole, direct, local file read verifies a change
             obs["grounds_completion"] = False
         qualifying = obs["grounds_assertion"] or obs["grounds_completion"]
         self.state.grounded_this_turn |= obs["grounds_assertion"]
@@ -445,6 +467,11 @@ class GateHooks:
                 self.state.last_verification_step = self.state.current_step
         if (tool in self.mutating_tools and not shell_read) or mcp == "mutating":
             self._record_mutation(tool_input, output)
+            if self.strict_reads and isinstance(tool_input, dict) \
+                    and tool_input.get("run_in_background"):
+                # it keeps running (and writing) after this call returns
+                self.state.pending_verification.add(
+                    UNPLACED + "background command still running")
         return {}
 
     async def post_tool_use_failure(self, input_data, tool_use_id, context):
@@ -453,6 +480,10 @@ class GateHooks:
         if input_data.get("hook_event_name") != "PostToolUseFailure":
             return {}
         if input_data.get("agent_id") and not self.gate_subagents:
+            if self.strict_reads:
+                tool = input_data.get("tool_name")
+                if not self._pure_read(tool if isinstance(tool, str) else ""):
+                    self._unknown_change(input_data)
             return {}
         self._tool_calls_this_turn += 1
         self.state.current_step += 1
@@ -463,6 +494,8 @@ class GateHooks:
         if ((tool in self.mutating_tools and not self._is_shell_read(tool, tool_input))
                 or _mcp_class(tool) == "mutating"):
             self._record_mutation(tool_input, failed=True)
+        elif self.strict_reads and not self._classified(tool, _mcp_class(tool)):
+            self._unknown_change(input_data, counted=True)
         return {}
 
     async def stop(self, input_data, tool_use_id, context):
@@ -574,6 +607,63 @@ class GateHooks:
         return (tool in self.mutating_tools and isinstance(command, str)
                 and shell.is_read_only(command, self._home))
 
+    def _pure_read(self, tool):
+        mcp = _mcp_class(tool)
+        return (tool in self.read_only_tools or tool in self.neutral_tools
+                or mcp in ("content", "listing", "neutral"))
+
+    def _classified(self, tool, mcp):
+        """Known to the gate: a read, a neutral tool, or a mutating tool it
+        can parse. Strict reads treats anything else as an unknown change."""
+        return (tool in self.read_only_tools or tool in self.mutating_tools
+                or tool in self.neutral_tools or mcp is not None)
+
+    def _unknown_change(self, input_data, counted=False):
+        """Strict reads, for a change the main agent's own tools didn't
+        make visible. A subagent's known mutating call is parsed like the
+        agent's own (its Bash commands too). An unclassified tool may have
+        changed anything, files no argument names included, so it blocks
+        verification for the turn until the tool is declared in
+        ``read_only_tools``, ``neutral_tools`` or ``mutating_tools``."""
+        if not counted:
+            self.state.current_step += 1
+        tool = input_data.get("tool_name")
+        tool = tool if isinstance(tool, str) else ""
+        tool_input = _absolutize(input_data.get("tool_input", ""), self._cwd)
+        failed = input_data.get("hook_event_name") == "PostToolUseFailure"
+        if tool in self.mutating_tools or _mcp_class(tool) == "mutating":
+            self._record_mutation(tool_input,
+                                  _output_text(input_data.get("tool_response", "")),
+                                  failed=failed)
+            return
+        targets = {t if t.startswith("/") else UNPLACED + t
+                   for t in path_values(tool_input) if isinstance(tool_input, dict)}
+        targets.add(UNPLACED + "unclassified tool %s may have changed files "
+                    "(declare it in read_only_tools, neutral_tools or "
+                    "mutating_tools)" % (tool or "?"))
+        self.state.note_unknown_change(targets)
+        self._mutated_this_turn = True
+
+    def _verifying_read(self, tool, tool_input, mcp):
+        """Strict reads: a direct read of one whole local file, by an
+        absolute path. Partial reads (offset/limit, head/tail), multi-file
+        reads, and read tools on MCP servers not trusted to be local don't
+        verify."""
+        if mcp == "content":
+            server = tool.split("__")[1] if tool.count("__") >= 2 else ""
+            if server not in self.trusted_mcp_servers or \
+                    tool.endswith("read_multiple_files"):
+                return False
+        elif tool not in self.content_tools:
+            return False
+        if not isinstance(tool_input, dict):
+            return False
+        if any(tool_input.get(k) not in (None, "", 0) for k in
+               ("offset", "limit", "head", "tail", "pages")):
+            return False
+        paths = path_values(tool_input)
+        return bool(paths) and all(p.startswith("/") for p in paths)
+
     def _note_cwd(self, input_data):
         """Track the session's working directory (every SDK hook input
         carries ``cwd``); relative paths resolve against it."""
@@ -592,9 +682,8 @@ class GateHooks:
         # owed a re-read, and mutated identifiers join the claim surface so
         # only reads of THOSE count as verification
         self._mutated_this_turn = True
-        is_shell = isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str)
         self.state.note_mutation(tool_input, self._cwd, output, failed, self._home,
-                                 strict=self.strict_reads and is_shell)
+                                 strict=self.strict_reads)
 
     def _reason(self, claim_type, verdict=None):
         # a verifier DOWNGRADE is a structural ACCEPT the verify_with tier
