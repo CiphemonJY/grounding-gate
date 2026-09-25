@@ -147,6 +147,7 @@ def tokenize(command):
             i += 2
             continue
         if command.startswith("$'", i):
+            expands = True        # its escapes are decoded: text isn't literal
             i += 2
             while True:
                 if i >= n:
@@ -235,6 +236,13 @@ def tokenize(command):
             tokens.append(("word", w))
             i = j
             continue
+        if c not in "<>&|;()":
+            # an ordinary character (the common case): no operator starts here
+            expands = expands or c == "$"
+            word.append(c)
+            in_word = True
+            i += 1
+            continue
         redir = next((r for r in _REDIRECTS if command.startswith(r, i)), None)
         if redir:
             fd = ""
@@ -276,6 +284,7 @@ class Stages(list):
     final_cwds = frozenset()
     loop_cd = False
     defines_function = False
+    background_group = False
 
 
 class Stage:
@@ -343,10 +352,24 @@ def resolve(path, cwd, home=None):
     return posixpath.normpath(posixpath.join(cwd, path) if cwd else path)
 
 
+def _operand(word):
+    """An operand after ``--`` may begin with ``-``: it names ``./-x``."""
+    if word.startswith("-") and word != "-":
+        out = _Word("./" + word)
+        out.expands = getattr(word, "expands", False)
+        return out
+    return word
+
+
 def _cd_target(words):
     """The directory a ``cd``/``pushd`` argument list names (options such
     as ``-P`` skipped), or ``None`` when it goes somewhere unknowable."""
+    opts = [w for w in words[1:] if w.startswith("-") and w != "-"]
     args = [w for w in words[1:] if not (w.startswith("-") and w != "-")]
+    if any(o not in ("-L", "-P", "--") for o in opts) or len(args) > 1 or (
+            words[0] in ("pushd", "popd") and (opts or any(
+                a[:1] in "+-" and a[1:].isdigit() for a in args))):
+        return "-"          # `cd a b`, `pushd -n`, `popd +1`: may go nowhere
     if not args:
         return "~"
     return args[0]
@@ -401,7 +424,7 @@ def parse(command, cwd="", home=None):
             groups.append((base, base_alt, kind))
         if words[:1] == ["case"]:
             words = []                  # `case WORD in` runs nothing
-        if words or redirects or subst:
+        if words or redirects or subst or any(_ASSIGNMENT.match(w) for w in argv):
             stage = Stage(list(words), redirects, subst, piped, piped_in,
                           base, home, sep, base_alt)
             stage.raw = list(argv)          # with assignments, for substitutions
@@ -412,7 +435,10 @@ def parse(command, cwd="", home=None):
                 exited = True             # later stages may never run
             if name == "set" and any(w in ("-e", "errexit") or re.match(r"^-\w*e", w)
                                      for w in words[1:]):
-                errexit = True
+                errexit = "+o" not in words[1:] and not conditional
+            if name == "set" and any(re.match(r"^\+\w*e", w) or w == "+o"
+                                     for w in words[1:]):
+                errexit = False
             if name in ("cd", "pushd", "popd") and any(
                     g[2] in ("for", "while", "until", "select") for g in groups):
                 stages.loop_cd = True      # a loop may cd again and again
@@ -422,7 +448,7 @@ def parse(command, cwd="", home=None):
             if name in ("cd", "pushd", "popd") and not piped and sep != "&" \
                     and not piped_in:
                 if name == "popd":
-                    new = dirstack.pop() if dirstack else None
+                    new = dirstack.pop() if dirstack and len(words) == 1 else None
                 else:
                     target = _cd_target(words)
                     if name == "pushd":
@@ -440,15 +466,16 @@ def parse(command, cwd="", home=None):
                         pending_alt = base
                     list_pin = base
                 elif sep == "||":
-                    or_cd = base          # `cd x || exit` pins; `cd x || y` doesn't
+                    or_cd = (base, len(saved))   # `cd x || exit` pins; `|| y` doesn't
                     base_alt = None
                 else:
                     base_alt = base
                 base = new
             elif or_cd is not None:
-                if name not in ("exit", "return") or sep in ("&&", "||", "|", "|&"):
+                if name not in ("exit", "return") or sep in ("&&", "||", "|", "|&") \
+                        or len(saved) != or_cd[1]:
                     base = None           # `cd x || other`: can't say where
-                    base_alt = or_cd
+                    base_alt = or_cd[0]
                 or_cd = None
             if sep == "||" and list_pin is not None:
                 # `cd x && y || z`: z also runs when the cd failed
@@ -512,7 +539,14 @@ def parse(command, cwd="", home=None):
         else:                                    # | |& ; && || & ;;
             if value in (";;", ";&", ";;&"):
                 in_pattern = True
+            before = len(stages)
             flush(value)
+            if value == "&" and (
+                    len(stages) == before or saved or groups or
+                    before and stages[before - 1].sep in ("&&", "||", "|", "|&")):
+                # `( ... ) &`, `a && b &`, `done &`: a whole list or group runs
+                # in the background, not just its last command
+                stages.background_group = True
     flush(";")
     # a stage after `&&` ran only if everything before it in its list
     # succeeded; the exit status is the LAST list's, so a successful call
@@ -885,6 +919,10 @@ def _sed_safe(script):
         i = blanks(i)
         return i if i >= n or s[i] in ";\n}#" else -1
 
+    def raw_end(i):
+        j = s.find("\n", i)
+        return n if j < 0 else j
+
     def line_end(i):
         while i < n and s[i] != "\n":
             i += 2 if s[i] == "\\" else 1
@@ -896,7 +934,7 @@ def _sed_safe(script):
             i += 1
             continue
         if s[i] == "#":
-            i = line_end(i)
+            i = raw_end(i)
             continue
         j = address(i)
         if j < 0:
@@ -928,10 +966,14 @@ def _sed_safe(script):
                 i += 1
             i = ends(i)
         elif c in "btT:":
-            while i < n and s[i] not in ";\n":
+            i = blanks(i)
+            while i < n and s[i] not in " \t;\n":
                 i += 1
-        elif c in "aicrR":
-            i = line_end(i)                       # text or a file it reads
+            i = ends(i)
+        elif c in "rR":
+            i = raw_end(i)                        # a file it reads
+        elif c in "aic":
+            i = line_end(i)                       # text (continues after \)
         elif c in "sy":
             if i >= n or s[i] in "\\\n":
                 return False
@@ -1035,10 +1077,22 @@ def _awk_parts(args):
     ``-f`` script, no in-place extension, no redirection/pipe/system/getline
     and no BEGIN/END summary), the files it reads, and whether what it
     prints is file text (fields, or whole lines) rather than a count."""
-    opts, ops = _split_args("awk", args)
-    if any(flag.startswith("-i") or flag.startswith("-f") or flag.startswith("-E")
-           or flag.startswith("--") for flag, _ in opts):
-        return False, [], False
+    ops, k = [], 0
+    while k < len(args):
+        a = args[k]
+        if a == "--":
+            ops += args[k + 1:]
+            break
+        if a in ("-F", "-v"):
+            k += 2
+            continue
+        if a.startswith("-F") or a.startswith("-v"):
+            k += 1
+            continue
+        if a.startswith("-") and a != "-":
+            return False, [], False      # only -F and -v are understood
+        ops.append(a)
+        k += 1
     if not ops:
         return False, [], False
     program = ops[0]
@@ -1141,7 +1195,7 @@ def _stage_read_only(stage):
             continue
         return False
     name, args, _ = _program(stage)
-    if _dangerous_env(stage):
+    if _dangerous_env(stage, strict=False):
         return False
     if not name:
         return True
@@ -1421,7 +1475,7 @@ _COPY_VALUE_OPTS = {
 _COPY_LONG = {
     "cp": {"--recursive", "--force", "--verbose", "--archive", "--preserve",
            "--no-preserve", "--dereference", "--no-dereference", "--no-clobber",
-           "--interactive", "--no-target-directory", "--link", "--symbolic-link",
+           "--interactive", "--no-target-directory",
            "--sparse", "--reflink", "--remove-destination", "--one-file-system",
            "--strip-trailing-slashes", "--attributes-only", "--update",
            "--target-directory"},
@@ -1438,7 +1492,7 @@ _COPY_LONG = {
               "--ignore-existing", "--no-perms", "--no-owner", "--no-group",
               "--omit-dir-times", "--delete-after", "--delete-excluded"},
 }
-_COPY_SHORT = {"cp": "rRafpvnidLHPlsuxTZ", "mv": "fvniuTZ", "install": "vCcpsDdT",
+_COPY_SHORT = {"cp": "rRafpvnidLHPuxTZ", "mv": "fvniuTZ", "install": "vCcpsDdT",
                "rsync": "avrzhPqcutlpgoDHSxWn"}
 _COPY_VALUED = {"-t", "-m", "-o", "-g", "--target-directory", "--mode",
                 "--owner", "--group", "--exclude", "--include"}
@@ -1478,6 +1532,9 @@ def _copy_targets(name, args, cwd, home):
     takes_value = _COPY_VALUE_OPTS.get(name, ())
     while k < len(args):
         a = args[k]
+        if a == "--":
+            ops += [_operand(x) for x in args[k + 1:]]
+            break
         if a in ("-t", "--target-directory") and k + 1 < len(args):
             target_dir = args[k + 1]
             k += 2
@@ -1502,6 +1559,10 @@ def _copy_targets(name, args, cwd, home):
         return [(UNPLACED + name + " into " + target, None)]   # which file?
     out = []
     for s in sources:
+        if s.endswith("/") and name != "install":
+            out.append((UNPLACED + name + " of directory " + s + " (read the "
+                        "files inside)", None))
+            continue
         if set(s) & set("*?[$`"):
             out.append((UNPLACED + name + " " + s, None))   # which files landed?
             continue
@@ -1795,6 +1856,9 @@ def _moves(stage):
     target_dir, ops, k = None, [], 0
     while k < len(args):
         a = args[k]
+        if a == "--":
+            ops += [_operand(x) for x in args[k + 1:]]
+            break
         if a in ("-t", "--target-directory") and k + 1 < len(args):
             target_dir = args[k + 1]
             k += 2
@@ -1811,7 +1875,8 @@ def _moves(stage):
     else:
         sources, target = ops, target_dir
     # a no-clobber or interactive mv may not move anything
-    certain = getattr(stage, "certain", True) and not any(
+    certain = getattr(stage, "certain", True) and name == "mv" and not any(
+        getattr(a, "expands", False) or "\\" in a or
         a in ("-n", "-i", "--no-clobber", "--interactive") or a.startswith("--update")
         or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("niu"))
         for a in args)
@@ -1829,7 +1894,9 @@ def _moves(stage):
         if target_dir is not None or len(sources) > 1:
             dst, alt = inside, None
         elif target.endswith("/"):
-            dst, alt = inside, target.rstrip("/")
+            # `mv src/ lib/` may rename the directory; a file moved to `x/`
+            # fails unless x is a directory
+            dst, alt = inside, target.rstrip("/") if s.endswith("/") else None
         else:
             dst, alt = target, inside
         src = resolve(s, cwd, stage.home)
@@ -1852,13 +1919,16 @@ def _removes(stage):
         return []
     recursive = bool(_short_flags(opts) & set("rR")) or "--recursive" in flags \
         or name == "rmdir"
-    certain = getattr(stage, "certain", True) and not (
+    certain = getattr(stage, "certain", True) and name == "rm" and not (
         _short_flags(opts) & set("iI") or "--interactive" in flags)
     out = []
     for o in ops:
-        r = resolve(o, cwd, stage.home)
+        r = resolve(_operand(o), cwd, stage.home)
         if r:
-            out.append((r, recursive, certain))
+            # only a plain literal operand certainly removed what it names
+            literal = not (set(o) & set("*?[\\") or o.endswith("/") or o.endswith("/.")
+                           or getattr(o, "expands", False))
+            out.append((r, recursive, certain and literal))
     return out
 
 
@@ -1896,25 +1966,48 @@ _QUIET_GIT = frozenset({"branch", "remote", "describe", "rev-list", "tag",
                         "shortlog", "reflog", "cat-file", "ls-remote",
                         "merge-base", "name-rev", "for-each-ref", "show-ref",
                         "symbolic-ref", "check-ignore", "count-objects"})
-# environment variables that make a later program run something else
+# environment variables known not to make a program write or run anything
+# else; any other variable a command is given (or exported) is unknown
+_SAFE_ENV = re.compile(
+    r"^(?:CI|NODE_ENV|DEBUG|VERBOSE|RUST_BACKTRACE|RUST_LOG|LANG|LANGUAGE|LC_\w+|"
+    r"TZ|TERM|COLUMNS|LINES|FORCE_COLOR|NO_COLOR|CLICOLOR\w*|PYTHONUNBUFFERED|"
+    r"PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|PYTHONWARNINGS|PYTHONIOENCODING|"
+    r"CARGO_TERM_COLOR|GO111MODULE|CGO_ENABLED|GOOS|GOARCH|NODE_NO_WARNINGS|"
+    r"TOKENIZERS_PARALLELISM|CUDA_VISIBLE_DEVICES|OMP_NUM_THREADS|MPLBACKEND|"
+    r"LOG_LEVEL|NPM_CONFIG_LOGLEVEL|npm_config_loglevel)$")
+# ... and the ones known to make a program run another (the default mode's
+# check, where a variable outside both lists is let through)
 _RISKY_ENV = re.compile(
     r"^(?:GIT_\w*|\w*PAGER|LESS\w*|PATH|LD_\w+|DYLD_\w+|\w*_COMMAND|EDITOR|"
     r"VISUAL|BASH_ENV|ENV|PYTHON\w*|NODE_OPTIONS|PERL5\w*|RUBYOPT|"
-    r"PROMPT_COMMAND|SHELLOPTS|BASHOPTS|IFS)=")
+    r"PROMPT_COMMAND|SHELLOPTS|BASHOPTS|IFS)$")
 
 
-def _dangerous_env(stage):
+def _dangerous_env(stage, strict=True):
     """``GIT_EXTERNAL_DIFF=x git diff``, ``PAGER=./x git log``, ``export
     GIT_CONFIG_...``: the environment makes a program run another."""
-    raw = [str(w) for w in getattr(stage, "raw", stage.argv)]
+    words = list(getattr(stage, "raw", stage.argv))
+    raw = [str(w) for w in words]
+    if any("@P}" in w or "@E}" in w for w in raw):
+        return True                     # ${x@P}: expands code kept as data
     k = 0
     while k < len(raw) and _ASSIGNMENT.match(raw[k]):
-        if _RISKY_ENV.match(raw[k]):
-            return True
+        value = raw[k].split("=", 1)[1]
+        if ("$(" in value or "`" in value) and not getattr(words[k], "subst", False):
+            return True                 # code stored for later evaluation
         k += 1
-    if k < len(raw) and raw[k] in ("export", "declare", "typeset", "readonly",
-                                   "local", "env"):
-        return any(_RISKY_ENV.match(w.lstrip("-")) for w in raw[k + 1:])
+    def unsafe(name):
+        return not _SAFE_ENV.match(name) if strict else bool(_RISKY_ENV.match(name))
+    names = [w.split("=", 1)[0] for w in raw[:k]]
+    if k < len(raw) and any(map(unsafe, names)):
+        return True                     # `NAME=x cmd`: cmd sees NAME
+    if k < len(raw) and raw[k] == "env":
+        return any(unsafe(w.split("=", 1)[0]) for w in raw[k + 1:]
+                   if _ASSIGNMENT.match(w))
+    if k < len(raw) and (raw[k] == "export" or raw[k] in ("declare", "typeset") and any(
+            w.startswith("-") and "x" in w for w in raw[k + 1:])):
+        return any(unsafe(w.split("=", 1)[0]) for w in raw[k + 1:]
+                   if not w.startswith("-"))
     return False
 
 
@@ -1935,6 +2028,10 @@ def _known_program(stage):
         return True             # (their file options are parsed by _writes)
     if _writes_via_option(name, args):
         return False
+    if args in (["--version"], ["-v"], ["-V"], ["version"]):
+        return True                    # `node -v`, `python3 --version`
+    if name == "git stash":
+        return args[:1] in (["list"], ["show"])
     if name == "git config":
         return any(a in ("--get", "--get-all", "--get-regexp", "--list", "-l")
                    for a in args)
@@ -1966,6 +2063,26 @@ def _runs_programs(stage, name, args):
             if a.startswith("-c") or a.startswith("--config-env") \
                     or a.startswith("--exec-path"):
                 return True
+    if name == "sort":
+        return any(a.startswith("--comp") for a in args)
+    if name in ("git fetch", "git ls-remote", "git pull", "git push", "git clone",
+                "git archive", "git submodule"):
+        return any(a.startswith(("--upload-pack", "--receive-pack", "--exec"))
+                   or name == "git ls-remote" and a.startswith("-u")
+                   for a in args)
+    if name == "alias":
+        return any("=" in a for a in args)
+    if name == "hash":
+        return any(a.startswith("-p") for a in args)
+    if name == "set":
+        return any(a in ("-a", "allexport") or re.match(r"^-\w*a", a) for a in args)
+    if name == "curl":
+        return any(("%output" in a or a.startswith(("-w@", "--write-out=@")))
+                   for a in args) or any(
+            args[k] in ("-w", "--write-out") and k + 1 < len(args)
+            and args[k + 1].startswith("@") for k in range(len(args)))
+    if name == "wget":
+        return any(a.startswith("--config") for a in args)
     if name == "git grep":
         return any(a.startswith("-O") or a.startswith("--open-files-in-pager")
                    for a in args)
@@ -1991,6 +2108,9 @@ def _inner_writes(stage, cwd, home, strict=False, depth=0):
         return [(UNPLACED + "substitutions nested too deep", None, None)]
     for text in _substitutions(stage, process=strict):
         inner = parse(text, cwd, home)
+        if strict and inner is not None and (inner.background_group or any(
+                s.sep == "&" for s in inner)):
+            found.append((UNPLACED + "background job in a substitution", None, None))
         for s in inner or ():
             found += _writes(s, strict)
             if strict and not _known_program(s):
@@ -2008,8 +2128,20 @@ _NO_WRITES = frozenset({
     "typeset", "readonly", "exit", "return", "break", "continue", "sleep",
     "wait", "read", "for", "select", "case", "in", "shopt", "alias",
     "unalias", "hash", "type", "umask", "ulimit", "jobs", "kill", "exec", "[[",
+    "date", "uname", "whoami", "id", "hostname", "printenv",
     "git add", "git fetch"})
-_BRACES = re.compile(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}")
+def _has_braces(word):
+    """``{a,b}`` or ``{1..3}`` in a word, found in one pass."""
+    opened = -1
+    for k, c in enumerate(word):
+        if c == "{":
+            opened = k
+        elif c == "}" and opened >= 0:
+            inner = word[opened + 1:k]
+            if ("," in inner or ".." in inner) and not set(inner) & set(" \t"):
+                return True
+            opened = -1
+    return False
 
 _KNOWN_EFFECTS = frozenset({"tee", "sed", "mv", "git mv", "rm", "git rm",
                             "unlink", "rmdir", "mkdir", "touch", "cp", "sort",
@@ -2033,6 +2165,9 @@ def effects(command, cwd="", output="", home=None, strict=False):
         out.append(("write", UNPLACED + "cd inside a loop", None, None))
     if strict and stages.defines_function:
         out.append(("write", UNPLACED + "a shell function", None, None))
+    if strict and stages.background_group:
+        out.append(("write", UNPLACED + "a list or group run in the background",
+                    None, None))
     pipes, credited = _credited_pipelines(stages)
     printed = bool((output or "").strip())
     sole = _sole_producer(pipes)
@@ -2043,7 +2178,7 @@ def effects(command, cwd="", output="", home=None, strict=False):
             if not _known_program(stage):
                 out.append(("opaque", tuple(name.split()) + tuple(args)))
             if strict and not _stage_read_only(stage) and any(
-                    _BRACES.search(str(w)) for w in stage.argv):
+                    _has_braces(str(w)) for w in stage.argv):
                 # cp f{,.bak}: the operands the program sees aren't these
                 out.append(("write", UNPLACED + "brace expansion", None, None))
             out += [("write",) + w for w in _writes(stage, strict)]
@@ -2066,4 +2201,12 @@ def effects(command, cwd="", output="", home=None, strict=False):
                 reads |= _stage_reads(stage, output, pipe is sole)[0]
         if k in credited and printed and _pipeline_shows(pipe):
             out += [("read", p) for p in sorted(reads)]
+    if _NOGLOB.search(command):
+        # globbing changed: an operand may not name what it seems to
+        out = [e[:3] + (False,) if e[0] == "remove" else
+               e[:4] + (False,) if e[0] == "move" else e for e in out]
     return out
+
+
+_NOGLOB = re.compile(r"\bset\s+[-+]\w*f|GLOBIGNORE|noglob|extglob|dotglob|nullglob|"
+                     r"failglob|nocaseglob|globstar")

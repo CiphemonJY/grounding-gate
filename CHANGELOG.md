@@ -120,6 +120,33 @@
   fuzz7 (with 75 new realistic templates) finds 0 leaks in 120,000
   sessions, and the older fuzzers find 0 in 160,000 more. The cd fuzzers
   run against real bash and find 0 leaks.
+- A fifth adversarial review found 15 more leak classes (6 medium, 9 low),
+  a quadratic brace check and no new traps in common workflows. The areas
+  that were still modelled by assumption now use allowlists or conservative
+  defaults:
+  - A background `&` on a list, pipeline, group or loop (or inside a
+    substitution) is unplaced, not just its last command.
+  - Only a plain, literal `rm`/`mv` releases a temp file. Not `git rm`,
+    `rmdir`, `unlink`, globs, trailing slashes, `$'…'` words, or anything
+    after `set -f`/`GLOBIGNORE`.
+  - The sed lexer matches GNU for `r`/`R` filenames, labels and comments.
+  - awk accepts only `-F` and `-v`.
+  - Environment variables passed to a command must be on a harmless
+    allowlist (strict mode); `export NAME` without a value is checked too.
+  - `curl -w %output`, `wget --config`, `sort --compress-program`, git
+    `--upload-pack`/`--exec`, `alias`, `hash -p`, `set -a`, `${x@P}` and
+    code stored in variables are unplaced.
+  - `cd`/`pushd`/`popd` are followed only in their plain form. `set +e`
+    ends errexit. `cd x || (exit)` doesn't pin the directory.
+  - Operands after `--` are kept, and `cp -s`/`-l` are no longer allowed.
+  - A directory copy (`cp -r src/ dst/`) says to read the files inside.
+  - Version checks, `date` and `git stash list` no longer block.
+  - The tokenizer's fast path makes a 13 KB command take 0.04 s, down
+    from 0.17 s.
+
+  The review fuzzers find 0 leaks in 245,000 sessions. The sed fuzzer,
+  checked against real GNU sed, finds no missed writers in 30,000 scripts.
+  There are 0 crashes in 100,000 random inputs.
 - Both modes: MCP `move_file` owes its destination; `create_directory`
   owes nothing; `git checkout -- f`, `git restore f`, `truncate`, `dd of=`,
   `sponge`, `curl -o`, `wget -O`, `install`, `rsync`, `ruby -i`, and

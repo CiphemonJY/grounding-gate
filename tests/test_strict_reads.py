@@ -505,6 +505,59 @@ STRICT_TRAPS_4 = {
 }
 
 
+# fifth strict review (each: a file changed and was never read, yet the
+# turn was accepted); the second table needs the turn's starting cwd
+STRICT_LEAKS_5 = {
+ "bg subshell":      [_bash("(sleep 5; sed -i s/1/2/ /p/a.cfg) &"), _R("/p/a.cfg")],
+ "bg brace":         [_bash("{ sleep 5; sed -i s/1/2/ /p/a.cfg; } &"), _R("/p/a.cfg")],
+ "bg and-list":      [_bash("sleep 3 && sed -i s/1/2/ /p/a.cfg && true &"), _R("/p/a.cfg")],
+ "bg pipeline":      [_bash("sort -o /p/b.cfg <(sleep 2; echo x) | true &"), _R("/p/b.cfg")],
+ "bg for":           [_bash("for i in 1; do sleep 2; sed -i s/1/2/ /p/a.cfg; done &"), _R("/p/a.cfg")],
+ "bg in comsub":     [_bash("x=$(sort -o /p/b.cfg <(sleep 2; echo x) >/dev/null 2>&1 &)"), _R("/p/b.cfg")],
+ "relax git rm":     [_E("/p/c.cfg"), _bash("echo x >> /p/a.cfg; git rm -q /p/a.cfg; true"), _R("/p/c.cfg")],
+ "relax rmdir":      [_E("/p/c.cfg"), _bash("echo x > /p/sub/a.cfg; rmdir /p/sub; true"), _R("/p/c.cfg")],
+ "relax unlink 2":   [_E("/p/c.cfg"), _bash("echo x > /p/a.cfg; unlink /p/a.cfg /p/z; true"), _R("/p/c.cfg")],
+ "relax rm f/":      [_E("/p/c.cfg"), _bash("echo x > /p/b.cfg; rm -f /p/b.cfg/; true"), _R("/p/c.cfg")],
+ "relax quoted glob":[_E("/p/c.cfg"), _bash("echo x > /p/b.cfg && rm -f '/p/*.cfg'"), _R("/p/c.cfg")],
+ "relax set -f":     [_E("/p/c.cfg"), _bash("set -f; echo x > /p/b.cfg; rm -f /p/*.cfg"), _R("/p/c.cfg")],
+ "relax GLOBIGNORE": [_E("/p/c.cfg"), _bash("GLOBIGNORE=/p/b.cfg; echo x > /p/b.cfg; rm -f /p/*.cfg"), _R("/p/c.cfg")],
+ "relax [^b]":       [_E("/p/c.cfg"), _bash("echo x > /p/b.cfg; rm -f /p/[^b]*.cfg; true"), _R("/p/c.cfg")],
+ "relax mv f/":      [_E("/p/c.cfg"), _bash("echo x > /p/a.cfg; mv /p/a.cfg /p/b.cfg/; true"), _R("/p/b.cfg"), _R("/p/c.cfg")],
+ "sed r\\\\NL":      [_E("/p/a.cfg"), _bash("sed -n -e 'r /p/x\\\nw /p/b.cfg' a.cfg"), _R("/p/a.cfg")],
+ "sed label ws":     [_E("/p/a.cfg"), _bash("sed -n ':a w /p/b.cfg' a.cfg"), _R("/p/a.cfg")],
+ "sed #\\\\NL":      [_E("/p/a.cfg"), _bash("sed -i 's/1/2/ #\\\nw /p/b.cfg' a.cfg"), _R("/p/a.cfg")],
+ "sed $'\\\\n'":     [_E("/p/a.cfg"), _bash("sed -i $'$a foo\\nw /p/b.cfg' a.cfg"), _R("/p/a.cfg")],
+ "awk -l rwarray":   [_E("/p/a.cfg"), _bash("gawk -l rwarray '{a[1]=$0; writea(\"/p/b.cfg\", a)}' a.cfg"), _R("/p/a.cfg")],
+ "awk -d":           [_E("/p/a.cfg"), _bash("gawk -d/p/b.cfg '{print}' a.cfg"), _R("/p/a.cfg")],
+ "awk -e -e":        [_E("/p/a.cfg"), _bash("gawk -e '{print}' -e '{print > \"/p/b.cfg\"}' a.cfg"), _R("/p/a.cfg")],
+ "awk -W exec":      [_E("/p/a.cfg"), _bash("awk -W exec /p/x.awk a.cfg"), _R("/p/a.cfg")],
+ "curl -w %output":  [_E("/p/a.cfg"), _bash("curl -s -o /dev/null -w '%output{/p/b.cfg}%{http_code}' https://x"), _R("/p/a.cfg")],
+ "wget --config":    [_E("/p/a.cfg"), _bash("wget -qO- --config=/p/w.rc https://x"), _R("/p/a.cfg")],
+ "env SSLKEYLOGFILE":[_E("/p/a.cfg"), _bash("SSLKEYLOGFILE=/p/b.cfg curl -s https://x"), _R("/p/a.cfg")],
+ "env WGETRC":       [_E("/p/a.cfg"), _bash("WGETRC=/p/w.rc wget -qO- https://x"), _R("/p/a.cfg")],
+ "sort compress":    [_E("/p/a.cfg"), _bash("sort -S 100K --compress-program=./x.sh big.txt > /dev/null"), _R("/p/a.cfg")],
+ "git upload-pack":  [_E("/p/a.cfg"), _bash("git ls-remote --upload-pack='touch /p/b.cfg; git-upload-pack' ."), _R("/p/a.cfg")],
+ "export no =":      [_E("/p/a.cfg"), _bash("read GIT_EXTERNAL_DIFF <<< /p/x.sh; export GIT_EXTERNAL_DIFF; git diff"), _R("/p/a.cfg")],
+ "alias":            [_E("/p/a.cfg"), _bash("shopt -s expand_aliases\nalias ls='sed -i s/1/2/ /p/b.cfg'\nls"), _R("/p/a.cfg")],
+ "hash -p":          [_E("/p/a.cfg"), _bash("hash -p /p/x.sh cat; cat a.cfg"), _R("/p/a.cfg")],
+ "cp --":            [_E("/p/a.cfg"), _bash("cp -- -x.cfg /p/b.cfg"), _R("/p/a.cfg")],
+ "mv --":            [_E("/p/a.cfg"), _bash("mv -- -x.cfg /p/b.cfg"), _R("/p/a.cfg")],
+ "${x@P}":           [_E("/p/a.cfg"), _bash("x='$(touch /p/b.cfg)'; echo \"${x@P}\""), _R("/p/a.cfg")],
+ "[[ -eq ]] arith":  [_E("/p/a.cfg"), _bash("i='x[$(touch /p/b.cfg)]'; [[ $i -eq 0 ]]"), _R("/p/a.cfg")],
+ "cp -s alias":      [_bash("cp -s /p/a.cfg /p/b.cfg"), _R("/p/b.cfg"), _E("/p/a.cfg"), _R("/p/a.cfg")],
+}
+
+STRICT_LEAKS_5_CWD = {
+ "pushd -n":         [_bash("pushd -n /p/sub && sed -i s/1/2/ a.cfg"), _R("/p/sub/a.cfg")],
+ "popd -n":          [_bash("pushd /p/sub && popd -n && sed -i s/1/2/ a.cfg"), _R("/p/a.cfg")],
+ "popd +1":          [_bash("pushd /p/sub && popd +1 && sed -i s/1/2/ a.cfg"), _R("/p/a.cfg")],
+ "cd x y; && ;":     [_bash("cd /p/sub x && true; sed -i s/1/2/ a.cfg"), _R("/p/sub/a.cfg")],
+ "cd || (exit)":     [_bash("cd /p/sub x || (exit 1); sed -i s/1/2/ a.cfg"), _R("/p/sub/a.cfg")],
+ "set -e; set +e":   [_bash("set -e; set +e; cd /p/sub x; sed -i s/1/2/ a.cfg"), _R("/p/sub/a.cfg")],
+ "errexit ignored":  [_bash("set -e; { cd /p/sub x; sed -i s/1/2/ a.cfg; } || true"), _R("/p/sub/a.cfg")],
+}
+
+
 STRICT_TRAPS_3 = {
     "cd && write, hook reports the new cwd": (
         _ev("Read", {"file_path": "/p/x"}, "x"),
@@ -527,6 +580,11 @@ def test_strict_review_leaks_are_rejected():
         assert strict_events(*events, **options) == "REJECT", name
     for name, events in STRICT_LEAKS_3.items():
         assert strict_events(*events) == "REJECT", name
+    for name, events in STRICT_LEAKS_5.items():
+        assert strict_events(*events) == "REJECT", name
+    for name, events in STRICT_LEAKS_5_CWD.items():
+        assert strict_events(_ev("Read", {"file_path": "/p/z"}, "z"), *events) \
+            == "REJECT", name
     for name, events in STRICT_LEAKS_4.items():
         assert strict_events(_ev("Read", {"file_path": "/p/z"}, "z"), *events) \
             == "REJECT", name

@@ -354,6 +354,17 @@ changed this turn, after its last change and after the last shell command.
   effect on the destination is known; curl/wget abbreviations, `GIT_*`,
   `PAGER` or `PATH` overrides, shell functions and `cd` inside loops end
   the turn unverified.
+- In strict mode a command may only pass environment variables from a short
+  known-harmless list (`CI`, `NODE_ENV`, `LANG`, `RUST_LOG`, ...). A temp
+  file is released only by a plain, literal `rm` or `mv` that certainly ran.
+  `cd` is followed only in its plain one-operand form. A background `&` on a
+  list or group, `alias`, `hash -p` and code stored in variables all end the
+  turn unverified.
+- What no command parser can see: strict mode trusts the machine's
+  configuration. A repository's `.git/config` (`core.fsmonitor`, external
+  diff and textconv drivers), `~/.curlrc`, `~/.wgetrc` or shell start-up
+  files can make an allowed command write files. Guard those separately if
+  the agent can edit them.
 - The price, measured by the benchmark: it blocks 51% of the benchmark's
   honest transcripts (the ones that verify through shell or search);
   moving or deleting a changed file ends the turn unverified; so does a
