@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Task classification for review** (`grounding_gate.classification`):
+  every finished turn is classified against a versioned standard
+  (`GG-TASK-1`). The standard has 8 categories and 10 risk flags, each with
+  a definition, a base risk and a reviewer checklist.
+  - A zero-token structural classifier works from the files changed, the
+    commands run and the gate's verdict.
+  - An optional classifier-model auditor (`LLMClassificationAuditor`) can
+    only escalate: add flags, raise the risk tier, or send the turn to human
+    review on a disagreement or a failure.
+  - The adapter exposes `last_classification`, `on_task_classified`,
+    `task_auditor`, `audit_min_risk` and `task_standard`.
+  - `render_review` prints a reviewer card.
+  - Checked by `tests/test_classification.py`: 24 labelled turns, the audit
+    merge rules, the auditor against a fake client, and the adapter wiring.
+    The auditor's request was also checked offline through the real SDK.
 - **Strict reads** (`GateHooks(strict_reads=True)`): a claim of change is
   accepted only after a direct file read (`Read`, `NotebookRead`, an MCP
   `read_file`-style tool) of every file changed this turn, taken after its

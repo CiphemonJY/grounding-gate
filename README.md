@@ -370,6 +370,76 @@ changed this turn, after its last change and after the last shell command.
   moving or deleting a changed file ends the turn unverified; so does a
   turn that only ran commands without reading what they changed.
 
+## Task classification for review
+
+After each turn ends, the adapter sorts it into a task category from a
+written standard. Reviewers can then route and check agent work the same
+way every time. The gate decides whether the claims are backed; this layer
+tells a reviewer what kind of task it was, how risky it is, and what to check.
+
+**The standard** (`grounding_gate.classification.STANDARD`, id `GG-TASK-1`)
+is versioned. Each entry has a definition, a base risk and a reviewer
+checklist.
+
+- **Categories:** a turn gets exactly one primary category. When it touched
+  several, the first in this list wins:
+  1. `operations`
+  2. `config`
+  3. `code`
+  4. `data`
+  5. `tests`
+  6. `docs`
+  7. `execution`
+  8. `inquiry`
+- **Flags:** a turn can have any number of these: `unverified_exit`,
+  `external_effect`, `destructive`, `security_sensitive`, `ci_change`,
+  `dependency_change`, `unmodelled_commands`, `subagent_changes`,
+  `large_change` and `failed_calls`.
+- **Risk tier:** the highest base risk among the category and the flags.
+- **Human review:** high-risk turns are marked for it.
+
+**How a turn is classified:**
+
+1. **Structural classifier** (zero-token and deterministic). It uses what the
+   turn actually did: the files it changed (sorted by path into
+   code/tests/docs/config/data), the commands it ran, and the gate's verdict.
+   Each category and flag records the evidence that produced it.
+2. **Model audit** (optional). A classifier model reviews that result against
+   the same standard. The audit can only escalate:
+   - it may add flags and raise the risk tier, never remove or lower them;
+   - a different category, or an audit that failed, sends the turn to human
+     review;
+   - the structural category stays the recorded one, with the auditor's kept
+     beside it.
+
+```python
+from grounding_gate.adapters.claude_agent_sdk import GateHooks
+from grounding_gate.classification import render_review
+from grounding_gate.classification.llm import LLMClassificationAuditor
+
+gate = GateHooks(
+    task_auditor=LLMClassificationAuditor(),   # claude-opus-5, effort "low"
+    audit_min_risk="medium",                   # skip the model on low-risk turns
+    on_task_classified=lambda c, record: print(render_review(c)),
+)
+# gate.last_classification.to_dict() -> category, flags, risk, checklist,
+# evidence, needs_human_review, audit
+```
+
+**About the model auditor:**
+- **Answer format:** it asks for JSON limited to the standard's own
+  category and flag IDs (structured outputs).
+- **Untrusted input:** it fences the turn record as data the agent produced,
+  so the model is told not to follow instructions inside it.
+- **Refusals:** it opts into server-side `fallbacks: "default"`, so a refused
+  request is re-run on Anthropic's recommended fallback model. Pass
+  `fallbacks=None` on Bedrock, Vertex or Foundry.
+- **Where it runs:** in the Stop hook, so each audited turn costs one model
+  call.
+- **Setup:** install it with `pip install grounding-gate[llm]`.
+- **Turning it off:** `classify_tasks=False`.
+- **Your own standard:** pass it as `task_standard=`.
+
 ## Measuring the error rate
 
 [examples/hallucination_bench.py](https://github.com/CiphemonJY/grounding-gate/blob/main/examples/hallucination_bench.py)

@@ -32,6 +32,7 @@ jobs:
           python tests/test_verifiers.py
           python tests/test_review_findings.py
           python tests/test_strict_reads.py
+          python tests/test_classification.py
       - name: Demo
         run: python examples/demo.py
       - name: Hallucination/error-rate benchmark (fails above 5% on any set)

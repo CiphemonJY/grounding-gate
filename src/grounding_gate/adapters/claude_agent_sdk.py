@@ -63,6 +63,8 @@ import re
 from ..boundary import ACCEPT, boundary_check
 from ..classifier import classify_observation
 from .. import shell
+from ..classification import (STANDARD, TaskRecord, audit_classification,
+                              classify_task)
 from ..state import (_PATH_KEYS, UNPLACED, GateState, Symbol, _trusted,
                      extract_identifiers, path_values, surface_hits)
 
@@ -387,6 +389,17 @@ class GateHooks:
             the shell parser doesn't model but you know write no files, by
             name or name and leading words (``("pytest", "npm test")``).
             Any other such program ends the turn unverified. Default ().
+        classify_tasks: classify every finished turn against ``task_standard``
+            for review (zero-token; see :mod:`grounding_gate.classification`).
+            The result is ``last_classification``. Default True.
+        task_auditor: optional classifier-model auditor (e.g.
+            ``LLMClassificationAuditor()``). It can only escalate: add flags,
+            raise the risk tier, or send the task to human review. It runs in
+            the Stop hook, so it adds a model call to each audited turn.
+        audit_min_risk: audit only turns whose structural risk is at least
+            this (``"low"``, ``"medium"``, ``"high"``). Default ``"low"``.
+        on_task_classified: optional callback ``f(classification, record)``
+            called once per finished turn.
         emit_progress: when True, the escape-valve ``systemMessage`` is suffixed
             with a compact ``progress()`` summary (a best-effort, user-facing
             event per the SDK contract). Default False. The reliable programmatic
@@ -409,7 +422,9 @@ class GateHooks:
                  verifier=None, emit_progress=False, home=None,
                  strict_reads=False, neutral_tools=DEFAULT_NEUTRAL_TOOLS,
                  trusted_mcp_servers=DEFAULT_TRUSTED_MCP_SERVERS,
-                 strict_trusted_programs=()):
+                 strict_trusted_programs=(), classify_tasks=True,
+                 task_standard=STANDARD, task_auditor=None, audit_min_risk="low",
+                 on_task_classified=None):
         extractors = dict(extractors or {})
         for tool in content_tools:
             extractors.setdefault(tool, _content_identifiers)
@@ -442,6 +457,13 @@ class GateHooks:
         # they ran and where (their writes land whenever they finish)
         self._background = {}
         self._agent_cwds = {}          # a subagent's last reported cwd
+        self.classify_tasks = classify_tasks
+        self.task_standard = task_standard
+        self.task_auditor = task_auditor
+        self.audit_min_risk = audit_min_risk
+        self.on_task_classified = on_task_classified
+        self.last_classification = None   # the latest finished turn's
+        self._turn_calls = []             # this turn's calls, for classification
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
@@ -484,6 +506,7 @@ class GateHooks:
         if not isinstance(input_data, dict) or \
                 input_data.get("hook_event_name") != "PostToolUse":
             return {}
+        self._log_call(input_data, failed=False)
         tool = input_data.get("tool_name")
         tool = tool if isinstance(tool, str) else ""
         subagent = bool(input_data.get("agent_id"))
@@ -570,6 +593,7 @@ class GateHooks:
         if not isinstance(input_data, dict) or \
                 input_data.get("hook_event_name") != "PostToolUseFailure":
             return {}
+        self._log_call(input_data, failed=True)
         if input_data.get("agent_id") and not self.gate_subagents:
             if self.strict_reads:
                 tool = input_data.get("tool_name")
@@ -608,6 +632,7 @@ class GateHooks:
             return {}
         if self._tool_calls_this_turn == 0 and not self._changed_by_others \
                 and not self._background:
+            self._classify("conversational", "none")
             return {}   # tool-free turn: conversational, gate exempt
 
         # a turn that changed nothing makes assertions, whatever earlier
@@ -622,6 +647,8 @@ class GateHooks:
         if verdict["verdict"] == ACCEPT:
             self._blocks = 0
             self.exited_unverified = False
+            self._classify("verified" if claim_type == "completion" else "grounded",
+                           claim_type)
             return {}
 
         self._blocks += 1
@@ -631,6 +658,7 @@ class GateHooks:
             self._blocks = 0
             self.exited_unverified = True
             self.state.halted = False   # exit clean, like ct=="unverified"
+            self._classify("unverified", claim_type)
             if self.emit_progress:
                 return {"systemMessage":
                         UNVERIFIED_BANNER + " " + _progress_line(self.progress())}
@@ -670,6 +698,7 @@ class GateHooks:
         self.exited_unverified = False
         self._blocks = 0
         self._tool_calls_this_turn = 0
+        self._turn_calls = []
         return {}
 
     # ------------------------------------------------------------ telemetry
@@ -687,6 +716,10 @@ class GateHooks:
             "tool_calls_this_turn": self._tool_calls_this_turn,
             "exited_unverified": self.exited_unverified,
             "strict_reads": self.strict_reads,
+            "task_category": (self.last_classification.category
+                              if self.last_classification else None),
+            "task_risk": (self.last_classification.risk
+                          if self.last_classification else None),
         })
         return p
 
@@ -838,6 +871,42 @@ class GateHooks:
         if shell.final_cwds(command, probe, self._home) == {probe}:
             return [reported]
         return [reported, None]
+
+    def _log_call(self, input_data, failed):
+        if not self.classify_tasks or len(self._turn_calls) >= 2000:
+            return
+        tool = input_data.get("tool_name")
+        self._turn_calls.append({
+            "tool": tool if isinstance(tool, str) else "",
+            "input": input_data.get("tool_input"),
+            "failed": failed,
+            "subagent": bool(input_data.get("agent_id")),
+        })
+
+    def _classify(self, verdict, claim_type):
+        """Classify the turn that just ended (never blocks or fails it)."""
+        if not self.classify_tasks:
+            return
+        try:
+            owed = set(self.state.changed_this_turn) | set(self.state.pending_verification)
+            record = TaskRecord(
+                calls=list(self._turn_calls),
+                changed_files=sorted(e for e in owed if not e.startswith(UNPLACED)),
+                verdict=verdict, claim_type=claim_type,
+                unplaced=sorted(e[len(UNPLACED):] for e in owed if e.startswith(UNPLACED)))
+            result = classify_task(record, self.task_standard,
+                                   tuple(self.trusted_mcp_servers))
+            levels = ("low", "medium", "high")
+            if self.task_auditor is not None and levels.index(result.risk) >= \
+                    levels.index(self.audit_min_risk if self.audit_min_risk in levels
+                                 else "low"):
+                result = audit_classification(record, result, self.task_auditor,
+                                              self.task_standard)
+            self.last_classification = result
+            if self.on_task_classified is not None:
+                self.on_task_classified(result, record)
+        except Exception:                                  # noqa: BLE001
+            self.last_classification = None    # review routing never breaks a turn
 
     def _trusted_server(self, tool):
         return _mcp_server(tool) in self.trusted_mcp_servers
