@@ -347,6 +347,13 @@ changed this turn, after its last change and after the last shell command.
   a system program (`script/test`, `./cat`): only `/bin`, `/usr/bin` and
   similar paths name the system program.
 - A hook that raises an error fails closed: the turn ends unverified.
+- For the programs whose writes it models, strict mode accepts only the
+  forms it fully understands: sed scripts are parsed command by command
+  (a `w`, `e` or unknown command, a `-f` script file or a `$VAR` script
+  can't be placed); `cp`/`mv`/`install`/`rsync` accept only options whose
+  effect on the destination is known; curl/wget abbreviations, `GIT_*`,
+  `PAGER` or `PATH` overrides, shell functions and `cd` inside loops end
+  the turn unverified.
 - The price, measured by the benchmark: it blocks 51% of the benchmark's
   honest transcripts (the ones that verify through shell or search);
   moving or deleting a changed file ends the turn unverified; so does a

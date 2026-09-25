@@ -434,6 +434,77 @@ STRICT_LEAKS_3 = {
                         _bash("nice " * 1000 + "sed -i s/1/2/ a.cfg")),
 }
 
+def _made(cmd):
+    """A command that changes a file other than /p/x.py, then a read of x."""
+    return (_E("/p/x.py"), _bash(cmd), _R("/p/x.py"))
+
+
+# fourth strict review
+STRICT_LEAKS_4 = {
+    "awk ; in a string": _made("awk '{print $1\";\"$2 > \"out.csv\"}' in.txt"),
+    "sed address flag": _made("sed -n '/error/I w errors.txt' app.log"),
+    "sed e in an address": _made("sed '/x;y/e' a"),
+    "sed s-delimiter in address": _made("sed '\\;s/a/;e echo' a"),
+    "sed delimiter in brackets": _made("sed -n '/[/]/w o' a"),
+    "sed -nf": _made("sed -nf fix.sed a.cfg"),
+    "sed -ne": _made("sed -ne '/x/w b.cfg' -e p a.cfg"),
+    "sed $SCRIPT": _made('sed -n "$S" a.cfg'),
+    "sed -l value": _made("sed -l 80 -n '/x/w b' a.cfg"),
+    "cp -vt": (_E("/p/x.py"), _bash("cp -vt out a.cfg"), _R("/p/a.cfg"), _R("/p/x.py")),
+    "install -Dt": (_E("/p/x.py"), _bash("install -Dt dist a.cfg"), _R("/p/a.cfg"),
+                    _R("/p/x.py")),
+    "cp --target-dir=": _made("cp --target-dir=out a.cfg"),
+    "git -c with add": _made("git -c core.fsmonitor='sed -i s/1/2/ b.cfg' add -A"),
+    "GIT_EXTERNAL_DIFF": _made("GIT_EXTERNAL_DIFF=./x git diff"),
+    "GIT_CONFIG_*": _made("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor "
+                          "GIT_CONFIG_VALUE_0=./x git status"),
+    "export PAGER": _made("export PAGER=./x; git -p log"),
+    "curl --dump-he": _made("curl --dump-he h.txt https://x"),
+    "wget --output-fi=": (_bash("wget -O a.json --output-fi=w.log https://x"),
+                          _R("/p/a.json")),
+    "cp --back": (_E("/p/x.py"), _bash("cp --back a b"), _R("/p/b"), _R("/p/x.py")),
+    "rm glob keeps dotfiles": (_bash("echo KEY=1 > out/.env && rm -rf out/*"),),
+    "unplaced paid by a same-named file": (
+        _bash("make"),
+        _ev("Write", {"file_path": "/tmp/<unplaced write> unmodelled command make "
+                                   "(declare it in strict_trusted_programs if it "
+                                   "writes no files)"}),
+        _R("/tmp/<unplaced write> unmodelled command make (declare it in "
+           "strict_trusted_programs if it writes no files)")),
+    "exit mid-command": (_bash("echo x > t.cfg; exit 0; rm t.cfg"),),
+    "deep substitution": _made("echo $(echo $(echo $(echo $(echo $(echo "
+                               "$(sed -i s/1/2/ b.cfg))))))"),
+    "wait in a subshell": (_bash("(sed -i s/1/2/ a.cfg &); wait"), _R("/p/a.cfg")),
+    "cd in a loop": (_bash("for i in 1 2; do echo x > out.txt; cd sub; done"),
+                     _R("/p/out.txt")),
+    "cd || cd": (_E("/p/x.py"), _bash("cd sub || cd other && sed -i s/1/2/ x"),
+                 _R("/p/sub/other/x"), _R("/p/x.py")),
+    "cd && y || z": (_bash("cd sub && make || echo f > status.txt"),
+                     _R("/p/sub/status.txt")),
+    "/dev/stdin": _made("echo x 0<a.cfg >/dev/stdin"),
+    "> -": _made("echo x > -"),
+    "touch": (_E("/p/x.py"), _R("/p/x.py"), _bash("touch new.cfg"), _R("/p/x.py")),
+    "function body": (_E("/p/x.py"), _bash("f() { cd sub && :; }; sed -i s/1/2/ x"),
+                      _R("/p/sub/x"), _R("/p/x.py")),
+}
+
+STRICT_TRAPS_4 = {
+    "TaskOutput finishes a job": (
+        _job("sleep 9; sed -i s/1/2/ b.cfg", "t1"),
+        _ev("TaskOutput", {"task_id": "t1"},
+            {"retrieval_status": "success", "task": {"status": "completed"}}),
+        _R("/p/b.cfg")),
+    "TaskStop ends a job": (_job("sleep 9; sed -i s/1/2/ b.cfg", "t2"),
+                            _ev("TaskStop", {"task_id": "t2"}, "stopped"),
+                            _R("/p/b.cfg")),
+    "cd || exit": (_bash("cd sub || exit 1; echo x > f"), _R("/p/sub/f")),
+    "set -e; cd": (_bash("set -e; cd sub; echo x > f"), _R("/p/sub/f")),
+    "rsync": (_bash("rsync -a b.cfg a.cfg"), _R("/p/a.cfg")),
+    "uniq and git branch": (_bash("sort f | uniq -c; git branch -a; echo x > a.cfg"),
+                            _R("/p/a.cfg")),
+}
+
+
 STRICT_TRAPS_3 = {
     "cd && write, hook reports the new cwd": (
         _ev("Read", {"file_path": "/p/x"}, "x"),
@@ -456,6 +527,9 @@ def test_strict_review_leaks_are_rejected():
         assert strict_events(*events, **options) == "REJECT", name
     for name, events in STRICT_LEAKS_3.items():
         assert strict_events(*events) == "REJECT", name
+    for name, events in STRICT_LEAKS_4.items():
+        assert strict_events(_ev("Read", {"file_path": "/p/z"}, "z"), *events) \
+            == "REJECT", name
 
 
 def test_a_hook_error_fails_closed():
@@ -503,6 +577,19 @@ def test_a_tool_free_turn_stays_exempt():
 def test_strict_review_traps_are_accepted():
     for name, events in list(STRICT_TRAPS.items()) + list(STRICT_TRAPS_3.items()):
         assert strict_events(*events) == "ACCEPT", name
+    for name, events in STRICT_TRAPS_4.items():
+        # (a session's first event names the cwd, as UserPromptSubmit does)
+        assert strict_events(_ev("Read", {"file_path": "/p/z"}, "z"), *events) \
+            == "ACCEPT", name
+
+
+def test_the_sed_scan_is_linear():
+    import time
+    from grounding_gate.shell import _sed_safe
+    script = "/^import.*from ['\"]" + "\\.\\.\\/" * 40 + "legacy/d"
+    started = time.perf_counter()
+    _sed_safe(script)
+    assert time.perf_counter() - started < 0.05
 
 
 def test_create_directory_owes_nothing():

@@ -309,8 +309,11 @@ class GateState:
         self.pending_aliases.pop(entry, None)
 
     def _owed_hits(self, idents):
-        """Owed entries ``idents`` pay: the entry's path, or its alias."""
-        hits = surface_hits(idents, self.pending_verification)
+        """Owed entries ``idents`` pay: the entry's path, or its alias. An
+        unplaced entry is paid by nothing (not a file named like it)."""
+        idents = {i for i in idents if UNPLACED not in str(i)}
+        hits = surface_hits(idents, {e for e in self.pending_verification
+                                     if not e.startswith(UNPLACED)})
         by_alias = {a: e for e, a in self.pending_aliases.items()
                     if e in self.pending_verification}
         hits |= {by_alias[a] for a in surface_hits(idents, set(by_alias))}
@@ -666,6 +669,15 @@ def _removed(operands, pending, recursive=True, aliases=None):
     return hits
 
 
+def _glob_match(parts, pattern):
+    """The shell's glob, part by part: ``*`` doesn't match a leading dot
+    (``rm -rf out/*`` leaves ``out/.env``)."""
+    pats = pattern.strip("/").split("/")
+    return len(parts) == len(pats) and all(
+        fnmatch.fnmatchcase(part, pat) and (not part.startswith(".") or pat.startswith("."))
+        for part, pat in zip(parts, pats))
+
+
 def _removes_path(operands, path, recursive):
     cpath = _canonical(path)
     for operand in operands:
@@ -674,11 +686,10 @@ def _removes_path(operands, path, recursive):
             parts = cpath.strip("/").split("/")
             depth = op.strip("/").count("/") + 1
             if op.startswith("/") and cpath.startswith("/"):
-                if len(parts) >= depth and fnmatch.fnmatchcase(
-                        "/" + "/".join(parts[:depth]), op) and (
+                if len(parts) >= depth and _glob_match(parts[:depth], op) and (
                         len(parts) == depth or recursive):
                     return True
-            elif fnmatch.fnmatchcase("/".join(parts[-depth:]), op.lstrip("/")):
+            elif len(parts) >= depth and _glob_match(parts[-depth:], op):
                 return True
             continue
         if surface_hits({operand}, {path}):

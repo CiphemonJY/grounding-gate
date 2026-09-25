@@ -93,11 +93,13 @@ DEFAULT_MUTATING_TOOLS = frozenset(
 # Strict reads treats every tool outside the known sets as a possible change.
 DEFAULT_NEUTRAL_TOOLS = frozenset(
     {"TodoWrite", "TodoRead", "ExitPlanMode", "AskUserQuestion",
-     "BashOutput", "KillShell", "KillBash"})
+     "BashOutput", "KillShell", "KillBash", "TaskOutput", "TaskStop"})
 # tools that report on (or stop) a background command started with
 # run_in_background, by the key naming it
 _BACKGROUND_TOOLS = {"BashOutput": "bash_id", "KillShell": "shell_id",
-                     "KillBash": "shell_id"}
+                     "KillBash": "shell_id", "TaskOutput": "task_id",
+                     "TaskStop": "task_id"}
+_JOB_REPORTS = ("BashOutput", "TaskOutput")      # the rest stop the job
 _JOB_DONE = re.compile(r"\s*<status>(?:completed|failed|killed|exited)</status>")
 # read arguments that select part of a file
 _PARTIAL_KEYS = ("offset", "limit", "head", "tail", "pages", "cell_id", "cell",
@@ -171,7 +173,10 @@ def _job_done(response):
     """A BashOutput response whose own status says the job ended (not text
     the job printed)."""
     if isinstance(response, dict):
-        return response.get("status") in ("completed", "failed", "killed", "exited")
+        task = response.get("task")
+        status = task.get("status") if isinstance(task, dict) else response.get("status")
+        return status in ("completed", "failed", "killed", "exited", "stopped",
+                          "cancelled", "error")
     return isinstance(response, str) and bool(_JOB_DONE.match(response))
 
 
@@ -591,7 +596,15 @@ class GateHooks:
 
     async def stop(self, input_data, tool_use_id, context):
         """Stop: the submit boundary. Block ungrounded finishes."""
-        if input_data.get("hook_event_name") != "Stop":
+        try:
+            return self._stop(input_data)
+        except Exception:                                  # noqa: BLE001
+            # never trap the agent, never pass it silently: the typed exit
+            self.exited_unverified = True
+            return {"systemMessage": UNVERIFIED_BANNER}
+
+    def _stop(self, input_data):
+        if not isinstance(input_data, dict) or input_data.get("hook_event_name") != "Stop":
             return {}
         if self._tool_calls_this_turn == 0 and not self._changed_by_others \
                 and not self._background:
@@ -627,6 +640,12 @@ class GateHooks:
 
     async def user_prompt_submit(self, input_data, tool_use_id, context):
         """UserPromptSubmit: a new turn — reset per-turn state and rope."""
+        try:
+            return self._user_prompt_submit(input_data)
+        except Exception:                                  # noqa: BLE001
+            return self._fail_closed()
+
+    def _user_prompt_submit(self, input_data):
         if isinstance(input_data, dict):
             self._note_cwd(input_data)     # where the turn's first command starts
         self.state.grounded_this_turn = False
@@ -844,12 +863,16 @@ class GateHooks:
     def _check_background(self, tool, tool_input, response):
         """A background command that finished (or was killed) wrote what it
         wrote by now: owe that as a change made at this point."""
-        job = tool_input.get(_BACKGROUND_TOOLS[tool]) \
-            if isinstance(tool_input, dict) else None
+        job = None
+        if isinstance(tool_input, dict):
+            for key in (_BACKGROUND_TOOLS[tool], "task_id", "bash_id", "shell_id"):
+                if tool_input.get(key) is not None:
+                    job = tool_input[key]
+                    break
         job = str(job) if job is not None else None
         if job not in self._background:
             return
-        if tool == "BashOutput" and not _job_done(response):
+        if tool in _JOB_REPORTS and not _job_done(response):
             return
         command, cwd = self._background.pop(job)
         self.state.pending_verification.discard(_job_entry(job))

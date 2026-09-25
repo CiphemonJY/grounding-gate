@@ -95,6 +95,31 @@
   The four fuzzers find 0 leaks in 330,000 more sessions, and there are
   0 crashes in 94,000 malformed inputs. Strict cost is unchanged: 51.0%,
   or 49.6% with `pytest` declared.
+- A fourth adversarial review found 16 more leak classes (7 medium,
+  9 low), an exponential-time regex, 4 traps and a minor crash. For the
+  riskiest parts strict mode now allowlists instead of pattern-matching:
+  - sed scripts are checked by a linear, command-by-command parser (it
+    catches every real writer in 9,000 scripts compared with GNU sed
+    `--sandbox`), and sed options are read getopt-style.
+  - `cp`/`mv`/`install`/`rsync` accept only understood options (a bundled
+    `-t`, `--target-dir`, `--back` or a remote path can't be placed).
+  - awk strings no longer hide `print > file`; in strict mode awk is a
+    viewer only without `>`, `|`, `@` or `system`/`getline`.
+  - curl/wget option abbreviations are unplaced.
+  - `git -c` (with any subcommand), risky environment assignments
+    (`GIT_*`, `PAGER`, `PATH`, `LD_*`, `*_COMMAND`, including `export`),
+    shell functions, `cd` in loops, `cd x || y`, `exit` mid-command, deep
+    substitutions and `touch` are covered; `*` no longer matches dotfiles;
+    an unplaced entry is never paid by a file named like it; `wait` in a
+    subshell doesn't collect the parent's jobs; `/dev/stdin` and `> -`
+    are writes.
+  - Claude Code's `TaskOutput`/`TaskStop` finish background jobs;
+    `cd x || exit`, `set -e; cd x`, rsync, `uniq` and read-only git
+    subcommands no longer block. Stop and UserPromptSubmit fail safe.
+
+  fuzz7 (with 75 new realistic templates) finds 0 leaks in 120,000
+  sessions, and the older fuzzers find 0 in 160,000 more. The cd fuzzers
+  run against real bash and find 0 leaks.
 - Both modes: MCP `move_file` owes its destination; `create_directory`
   owes nothing; `git checkout -- f`, `git restore f`, `truncate`, `dd of=`,
   `sponge`, `curl -o`, `wget -O`, `install`, `rsync`, `ruby -i`, and
